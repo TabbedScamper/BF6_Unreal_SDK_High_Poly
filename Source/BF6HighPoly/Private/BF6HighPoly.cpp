@@ -1223,6 +1223,24 @@ namespace
 		// rebuilds the analytic normal so the lighting follows the crests.
 		// Deep-water dispersion (speed = sqrt(g/k)) so long swells outrun the
 		// chop, which is most of what makes a sea read as one.
+		auto Scal = [&](const TCHAR* Nm, float Def, int32 Y) -> UMaterialExpressionScalarParameter*
+		{
+			UMaterialExpressionScalarParameter* S =
+				Cast<UMaterialExpressionScalarParameter>(
+					UMaterialEditingLibrary::CreateMaterialExpression(
+						M, UMaterialExpressionScalarParameter::StaticClass(), -900, Y));
+			if (S) { S->ParameterName = Nm; S->DefaultValue = Def; }
+			return S;
+		};
+
+		// How pronounced the fine ripples are. Ours, not the game's - the
+		// game gets this detail from its simulation's normal cascades.
+		UMaterialExpressionScalarParameter* Det = Scal(TEXT("DetailRipple"), 1.f, 1220);
+		UMaterialExpressionCameraPositionWS* CamP =
+			Cast<UMaterialExpressionCameraPositionWS>(
+				UMaterialEditingLibrary::CreateMaterialExpression(
+					M, UMaterialExpressionCameraPositionWS::StaticClass(), -900, 840));
+
 		auto WaveInputs = [&](UMaterialExpressionCustom* X,
 		                      UMaterialExpressionWorldPosition* WP,
 		                      UMaterialExpressionTime* Tm,
@@ -1274,15 +1292,6 @@ namespace
 				Wv[i]->DefaultValue = FLinearColor(1.f, 0.f, 0.f, 1.f);
 			}
 		}
-		auto Scal = [&](const TCHAR* Nm, float Def, int32 Y) -> UMaterialExpressionScalarParameter*
-		{
-			UMaterialExpressionScalarParameter* S =
-				Cast<UMaterialExpressionScalarParameter>(
-					UMaterialEditingLibrary::CreateMaterialExpression(
-						M, UMaterialExpressionScalarParameter::StaticClass(), -900, Y));
-			if (S) { S->ParameterName = Nm; S->DefaultValue = Def; }
-			return S;
-		};
 		UMaterialExpressionScalarParameter* Gn = Scal(TEXT("WaveGain"), 0.f, 860);
 		UMaterialExpressionScalarParameter* Ch = Scal(TEXT("WaveChop"), 0.4f, 920);
 		UMaterialExpressionScalarParameter* Bl = Scal(TEXT("WaveBaseLen"), 26.f, 980);
@@ -1294,13 +1303,6 @@ namespace
 		// The shortest wavelength this water's GRID can represent, set per
 		// surface from its vertex spacing.
 		UMaterialExpressionScalarParameter* MnL = Scal(TEXT("MinDispLen"), 24.f, 1160);
-		// How pronounced the fine ripples are. Ours, not the game's - the
-		// game gets this detail from its simulation's normal cascades.
-		UMaterialExpressionScalarParameter* Det = Scal(TEXT("DetailRipple"), 1.f, 1220);
-		UMaterialExpressionCameraPositionWS* CamP =
-			Cast<UMaterialExpressionCameraPositionWS>(
-				UMaterialEditingLibrary::CreateMaterialExpression(
-					M, UMaterialExpressionCameraPositionWS::StaticClass(), -900, 840));
 
 		UMaterialExpressionCustom* WpoX =
 			Cast<UMaterialExpressionCustom>(
@@ -1338,7 +1340,7 @@ namespace
 						M, UMaterialExpressionCustom::StaticClass(), -300, 1160));
 			if (FoamX)
 			{
-				FoamX->Code = TEXT("// Each wave arrives as float3 (dir.x, dir.y, amplitude): a Custom\n// node takes a VectorParameter as float3, so asking for float4 here\n// is a compile error and a compile error is a GREY material.\nfloat3 w[8] = {W0,W1,W2,W3,W4,W5,W6,W7};\n// powers of 1/phi, so the sum does not repeat inside a level\nconst float ratio[8] = {1.0, 0.618, 0.382, 0.236, 0.146, 0.090, 0.056, 0.034};\nfloat2 pm = WPos.xy * 0.01;\n// the divergence of the horizontal displacement - BF6 applies it with a\n// MINUS sign, so foam belongs on POSITIVE divergence\nfloat div = 0.0;\nfor (int i = 0; i < 8; i++) {\n  float len = max(ratio[i] * BaseLen, 0.5);\n  if (len < MinLen) continue;\n  float2 d = normalize(w[i].xy + float2(1e-5, 0));\n  float A = w[i].z * Gain;\n  float k = 6.2831853 / len;\n  float ph = k * dot(d, pm) - sqrt(9.81 * k) * T;\n  div += Chop * A * k * sin(ph);\n}\nreturn saturate(max(0.0, div - Thr * 0.02) * Mx);");
+				FoamX->Code = TEXT("float3 w[8] = {W0,W1,W2,W3,W4,W5,W6,W7};\nconst float ratio[8] = {1.0, 0.618, 0.382, 0.236, 0.146, 0.090, 0.056, 0.034};\nfloat2 pm = WPos.xy * 0.01;\n// The divergence of the horizontal displacement - the same quantity\n// csWaterOceanDiff folds into foam. BF6 applies that displacement with\n// a MINUS sign, so foam belongs on POSITIVE divergence; the other way\n// round it collects in the troughs.\nfloat div = 0.0;\nfloat scale = 0.0;\nfor (int i = 0; i < 8; i++) {\n  float len = max(ratio[i] * BaseLen, 0.5);\n  if (len < MinLen) continue;\n  float2 d = normalize(w[i].xy + float2(1e-5, 0));\n  float A = w[i].z * Gain;\n  float k = 6.2831853 / len;\n  float ph = k * dot(d, pm) - sqrt(9.81 * k) * T;\n  float term = Chop * A * k;\n  div   += term * sin(ph);\n  scale += term;            // the most this sum could reach\n}\n// NORMALISED BY WHAT THIS SEA CAN ACTUALLY FOLD.\n// The authored FoamThreshold lives on the scale of the game's own FFT\n// Jacobian, which is not the scale of an eight-component analytic sum:\n// used raw it sits far above anything our divergence reaches and no\n// foam ever appears. Dividing by the maximum this wave set can produce\n// puts crest and trough at +1 and -1, so the threshold becomes a\n// fraction of the way up the crest and behaves the same on every map.\nfloat f = div / max(scale, 1e-4);\nfloat bias = clamp(Thr / 60.0, 0.02, 0.85);\nreturn saturate((f - bias) / max(1.0 - bias, 0.05)) * Mx;");
 				FoamX->OutputType = CMOT_Float1;
 				FoamX->Description = TEXT("BF6 Jacobian foam");
 				FoamX->Inputs.Empty();
@@ -1531,7 +1533,12 @@ namespace
 	// Metres over which the authored colour is reached. The game carries this
 	// per material (CB1[0].w); we have no reader for it yet, so it is one
 	// number here rather than a guess dressed as data.
-	float AbsorptionDistanceM = 10.f;
+	// Per-metre strengths for Unreal's two water coefficients. The HUE and
+	// the BRIGHTNESS below come from the level's own authored colour; these
+	// two numbers are CALIBRATION and are labelled as such so nobody later
+	// mistakes them for something recovered from the game.
+	float ScatterPerM = 0.60f;
+	float AbsorbPerM  = 0.55f;
 
 	UMaterialInstanceDynamic* WaterMaterialFor(UObject* Outer, const BF6HP::FCore::FWater& W,
 	                                           const FWaveSet* Waves)
@@ -1571,22 +1578,46 @@ namespace
 		// (0, 0.076, 0.082) gives roughly (0.92, 0.26, 0.25) at d = 10: red
 		// gone in a metre, blue-green carrying, which is what a sea looks
 		// like.
-		FLinearColor C = W.Shallow.R >= 0.f ? W.Shallow : FLinearColor(0.02f, 0.20f, 0.24f);
-		const float D = AbsorptionDistanceM;
-		auto Ext = [D](float c) {
-			// clamp only against log(0); do NOT clamp the top, or a dark
-			// authored channel is lifted into the others and the tint dies.
-			return -FMath::Loge(FMath::Max(c, 1e-4f)) / FMath::Max(D, 0.5f);
-		};
-		MID->SetVectorParameterValue(TEXT("Absorption"),
-			FLinearColor(Ext(C.R), Ext(C.G), Ext(C.B)));
-		// Scattering is what the body of the water throws back. Tinted like
-		// the authored colour but weak: the sea's brightness comes from the
-		// sky reflection, not from the volume.
+		// WHAT THE AUTHORED COLOUR ACTUALLY CARRIES.
+		//
+		// The recovered pixel shader turns it into an albedo with
+		// saturate(1 + ln(c)/d), where d is a per-material absorption
+		// distance the game keeps at CB1[0].w. We have no reader for d yet,
+		// and a single fixed d cannot serve every map: at d = 1 Tsuru Reef's
+		// bright (0.569, 0.829, 0.890) gives the vibrant (0.44, 0.81, 0.88)
+		// the map is known for, while Aftermath's much darker
+		// (0, 0.076, 0.082) collapses to black.
+		//
+		// So the colour is split into the two things it is really telling us,
+		// both of which survive without knowing d:
+		//   HUE        - which way the water leans, and
+		//   BRIGHTNESS - how much light comes back out of it.
+		// Hue drives the scattering colour and the absorption's complement;
+		// brightness drives how strongly the volume scatters. That keeps a
+		// reef turquoise and a canal dark green without inventing a distance
+		// for either.
+		FLinearColor C = W.Shallow.R >= 0.f ? W.Shallow : FLinearColor(0.10f, 0.45f, 0.55f);
+		const float Peak = FMath::Max3(C.R, FMath::Max(C.G, 0.f), FMath::Max(C.B, 0.f));
+		const FLinearColor Hue = Peak > 1e-4f
+			? FLinearColor(C.R / Peak, C.G / Peak, C.B / Peak)
+			: FLinearColor(0.2f, 0.9f, 1.0f);
+		// Square root, because the authored brightness spans two orders of
+		// magnitude and a linear mapping makes every dark water pitch black.
+		const float Bright = FMath::Sqrt(FMath::Clamp(Peak, 0.f, 1.f));
+
+		// SCATTERING is what comes back out: the water's own colour, at a
+		// strength set by how bright the map authored it.
 		MID->SetVectorParameterValue(TEXT("Scattering"), FLinearColor(
-			FMath::Max(C.R, 0.002f) * 0.35f,
-			FMath::Max(C.G, 0.002f) * 0.35f,
-			FMath::Max(C.B, 0.002f) * 0.35f));
+			Hue.R * Bright * ScatterPerM,
+			Hue.G * Bright * ScatterPerM,
+			Hue.B * Bright * ScatterPerM));
+		// ABSORPTION is the complement of the hue: the channels the water
+		// does NOT return are the ones it takes out of the beam, which is
+		// why red dies within a metre or two and blue-green carries.
+		MID->SetVectorParameterValue(TEXT("Absorption"), FLinearColor(
+			(1.f - Hue.R) * AbsorbPerM + 0.02f,
+			(1.f - Hue.G) * AbsorbPerM + 0.02f,
+			(1.f - Hue.B) * AbsorbPerM + 0.02f));
 		return MID;
 	}
 
