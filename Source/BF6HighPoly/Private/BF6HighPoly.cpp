@@ -1219,7 +1219,8 @@ namespace
 		                      UMaterialExpressionVectorParameter* Wv[8],
 		                      UMaterialExpressionScalarParameter* Gn,
 		                      UMaterialExpressionScalarParameter* Ch,
-		                      UMaterialExpressionScalarParameter* Bl)
+		                      UMaterialExpressionScalarParameter* Bl,
+		                      UMaterialExpressionScalarParameter* Bl2)
 		{
 			X->Inputs.Empty();
 			auto In = [&X](const TCHAR* Nm, UMaterialExpression* E)
@@ -1237,6 +1238,7 @@ namespace
 			In(TEXT("Gain"), Gn);
 			In(TEXT("Chop"), Ch);
 			In(TEXT("BaseLen"), Bl);
+			In(TEXT("MinLen"), Bl2);
 		};
 
 		UMaterialExpressionWorldPosition* WP =
@@ -1277,6 +1279,9 @@ namespace
 		// LINEARISED JACOBIAN of the horizontal displacement, thresholded.
 		UMaterialExpressionScalarParameter* FTh = Scal(TEXT("FoamThreshold"), 8.f, 1040);
 		UMaterialExpressionScalarParameter* FMx = Scal(TEXT("FoamMax"), 1.f, 1100);
+		// The shortest wavelength this water's GRID can represent, set per
+		// surface from its vertex spacing.
+		UMaterialExpressionScalarParameter* MnL = Scal(TEXT("MinDispLen"), 24.f, 1160);
 
 		UMaterialExpressionCustom* WpoX =
 			Cast<UMaterialExpressionCustom>(
@@ -1286,19 +1291,19 @@ namespace
 			Cast<UMaterialExpressionCustom>(
 				UMaterialEditingLibrary::CreateMaterialExpression(
 					M, UMaterialExpressionCustom::StaticClass(), -300, 980));
-		if (WpoX && NrmX && WP && Tm && Gn && Ch && Bl &&
+		if (WpoX && NrmX && WP && Tm && Gn && Ch && Bl && MnL &&
 			Wv[0] && Wv[1] && Wv[2] && Wv[3] && Wv[4] && Wv[5] && Wv[6] && Wv[7])
 		{
-			WpoX->Code = TEXT("float3 disp = float3(0,0,0);\nfloat4 w[8] = {W0,W1,W2,W3,W4,W5,W6,W7};\nfloat2 pm = WPos.xy * 0.01;\nfor (int i = 0; i < 8; i++) {\n  float2 d = normalize(w[i].xy + float2(1e-5, 0));\n  float A = w[i].z * Gain;\n  float len = max(w[i].w * BaseLen, 1.0);\n  float k = 6.2831853 / len;\n  float ph = k * dot(d, pm) - sqrt(9.81 * k) * T;\n  disp.xy += d * (Chop * A) * cos(ph);\n  disp.z  += A * sin(ph);\n}\nreturn disp * 100.0;");
+			WpoX->Code = TEXT("// GATED BY WHAT THE GRID CAN CARRY.\n// A component shorter than MinDispLen cannot be represented by these\n// vertices - sampled at under two per wavelength it is not a small wave,\n// it is noise. Those components are dropped here and live in the normal\n// instead, which is exactly how the game splits it: displacement from\n// the long cascades, detail from normal maps.\nfloat3 disp = float3(0,0,0);\nfloat4 w[8] = {W0,W1,W2,W3,W4,W5,W6,W7};\nfloat2 pm = WPos.xy * 0.01;\nfor (int i = 0; i < 8; i++) {\n  float len = max(w[i].w * BaseLen, 0.5);\n  if (len < MinLen) continue;\n  float2 d = normalize(w[i].xy + float2(1e-5, 0));\n  float A = w[i].z * Gain;\n  float k = 6.2831853 / len;\n  float ph = k * dot(d, pm) - sqrt(9.81 * k) * T;\n  disp.xy += d * (Chop * A) * cos(ph);\n  disp.z  += A * sin(ph);\n}\nreturn disp * 100.0;");
 			WpoX->OutputType = CMOT_Float3;
 			WpoX->Description = TEXT("BF6 Gerstner displacement");
-			WaveInputs(WpoX, WP, Tm, Wv, Gn, Ch, Bl);
+			WaveInputs(WpoX, WP, Tm, Wv, Gn, Ch, Bl, MnL);
 			UMaterialEditingLibrary::ConnectMaterialProperty(WpoX, TEXT(""), MP_WorldPositionOffset);
 
-			NrmX->Code = TEXT("float3 n = float3(0,0,1);\nfloat4 w[8] = {W0,W1,W2,W3,W4,W5,W6,W7};\nfloat2 pm = WPos.xy * 0.01;\nfor (int i = 0; i < 8; i++) {\n  float2 d = normalize(w[i].xy + float2(1e-5, 0));\n  float A = w[i].z * Gain;\n  float len = max(w[i].w * BaseLen, 1.0);\n  float k = 6.2831853 / len;\n  float ph = k * dot(d, pm) - sqrt(9.81 * k) * T;\n  float wa = k * A;\n  n.xy -= d * wa * cos(ph);\n  n.z  -= Chop * wa * sin(ph);\n}\nreturn normalize(n);");
+			NrmX->Code = TEXT("// The normal carries the detail the geometry cannot, but not without\n// limit: a component around a metre long shimmers per pixel at any\n// distance and reads as static noise. Anything under two metres is\n// dropped, and each component is faded out as its wavelength\n// approaches that floor rather than vanishing in one step.\nfloat3 n = float3(0,0,1);\nfloat4 w[8] = {W0,W1,W2,W3,W4,W5,W6,W7};\nfloat2 pm = WPos.xy * 0.01;\nfor (int i = 0; i < 8; i++) {\n  float len = max(w[i].w * BaseLen, 0.5);\n  float vis = saturate((len - 2.0) * 0.5);\n  if (vis <= 0.0) continue;\n  float2 d = normalize(w[i].xy + float2(1e-5, 0));\n  float A = w[i].z * Gain * vis;\n  float k = 6.2831853 / len;\n  float ph = k * dot(d, pm) - sqrt(9.81 * k) * T;\n  float wa = k * A;\n  n.xy -= d * wa * cos(ph);\n  n.z  -= Chop * wa * sin(ph);\n}\nreturn normalize(n);");
 			NrmX->OutputType = CMOT_Float3;
 			NrmX->Description = TEXT("BF6 Gerstner normal");
-			WaveInputs(NrmX, WP, Tm, Wv, Gn, Ch, Bl);
+			WaveInputs(NrmX, WP, Tm, Wv, Gn, Ch, Bl, MnL);
 			UMaterialEditingLibrary::ConnectMaterialProperty(NrmX, TEXT(""), MP_Normal);
 			// The node writes a WORLD normal; the plane's tangent frame is not
 			// part of the math.
@@ -1306,7 +1311,7 @@ namespace
 		}
 
 		// ---- FOAM, from the folding of the displacement field -------------
-		if (WP && Tm && Gn && Ch && Bl && FTh && FMx && Wv[0])
+		if (WP && Tm && Gn && Ch && Bl && MnL && FTh && FMx && Wv[0])
 		{
 			UMaterialExpressionCustom* FoamX =
 				Cast<UMaterialExpressionCustom>(
@@ -1314,7 +1319,7 @@ namespace
 						M, UMaterialExpressionCustom::StaticClass(), -300, 1160));
 			if (FoamX)
 			{
-				FoamX->Code = TEXT("// Folding, the way csWaterOceanDiff computes it: the divergence of the\n// horizontal displacement field. BF6 applies that displacement with a\n// MINUS sign (the thickness pass reconstructs p = grid - scale*D), so\n// foam belongs on POSITIVE divergence. Get the sign wrong and foam\n// collects in the troughs instead of on the crests.\nfloat div = 0.0;\nfloat4 w[8] = {W0,W1,W2,W3,W4,W5,W6,W7};\nfloat2 pm = WPos.xy * 0.01;\nfor (int i = 0; i < 8; i++) {\n  float2 d = normalize(w[i].xy + float2(1e-5, 0));\n  float A = w[i].z * Gain;\n  float len = max(w[i].w * BaseLen, 1.0);\n  float k = 6.2831853 / len;\n  float ph = k * dot(d, pm) - sqrt(9.81 * k) * T;\n  div += Chop * A * k * sin(ph);\n}\n// foam = max(0, fold - threshold) * max, the recovered form. The\n// authored threshold is on the sim's own scale (0..290 game-wide), so\n// it is normalised here rather than used raw.\nfloat fold = div;\nreturn saturate(max(0.0, fold - Thr * 0.02) * Mx);");
+				FoamX->Code = TEXT("// Folding, the way csWaterOceanDiff computes it: the divergence of the\n// horizontal displacement. BF6 applies that displacement with a MINUS\n// sign, so foam belongs on POSITIVE divergence - the other way round it\n// collects in the troughs. Only components that actually displace can\n// fold, so this uses the same gate as the displacement.\nfloat div = 0.0;\nfloat4 w[8] = {W0,W1,W2,W3,W4,W5,W6,W7};\nfloat2 pm = WPos.xy * 0.01;\nfor (int i = 0; i < 8; i++) {\n  float len = max(w[i].w * BaseLen, 0.5);\n  if (len < MinLen) continue;\n  float2 d = normalize(w[i].xy + float2(1e-5, 0));\n  float A = w[i].z * Gain;\n  float k = 6.2831853 / len;\n  float ph = k * dot(d, pm) - sqrt(9.81 * k) * T;\n  div += Chop * A * k * sin(ph);\n}\nreturn saturate(max(0.0, div - Thr * 0.02) * Mx);");
 				FoamX->OutputType = CMOT_Float1;
 				FoamX->Description = TEXT("BF6 Jacobian foam");
 				FoamX->Inputs.Empty();
@@ -1331,6 +1336,7 @@ namespace
 				In(TEXT("Gain"), Gn);
 				In(TEXT("Chop"), Ch);
 				In(TEXT("BaseLen"), Bl);
+				In(TEXT("MinLen"), MnL);
 				In(TEXT("Thr"), FTh);
 				In(TEXT("Mx"), FMx);
 
@@ -1390,10 +1396,13 @@ namespace
 		float Gain = 0.f, Chop = 0.4f, BaseLen = 26.f;
 		// The game's own foam controls, carried through from the sim entity.
 		float FoamThreshold = 8.f, FoamMax = 1.f;
+		// metres between grid vertices, so the shader can drop wave
+		// components the geometry cannot represent
+		float VertexSpacingM = 8.f;
 		bool  bValid = false;
 	};
 
-	FWaveSet DeriveWaves(const BF6HP::FCore::FWaterSim& S, bool bOcean)
+	FWaveSet DeriveWaves(const BF6HP::FCore::FWaterSim& S, bool bOcean, float SizeM)
 	{
 		static const float Ratio[8] = { 1.0f, 0.618f, 0.382f, 0.236f,
 		                                0.146f, 0.090f, 0.056f, 0.034f };
@@ -1420,7 +1429,10 @@ namespace
 
 		const float Top = FMath::Max(Picked[0].Y, 1e-4f);
 		int32 n = 0;
-		auto Fan = [&R, &n, &Ratio](float BaseAng, float Amp)
+		// Ratio is a function-scope STATIC, so it has static storage duration
+		// and must not be named in the capture list - it is reachable without
+		// one. Capturing it is a hard error, not a warning.
+		auto Fan = [&R, &n](float BaseAng, float Amp)
 		{
 			const float Off = FMath::DegreesToRadians(
 				46.f * (FMath::Fmod((float)n * 0.61803399f, 1.f) - 0.5f));
@@ -1450,7 +1462,10 @@ namespace
 		// Choppiness -> crest sharpening, clamped below 1 or the phase warp
 		// folds crests into themselves.
 		R.Chop = FMath::Clamp(S.Choppiness, 0.05f, 0.9f);
-		R.BaseLen = bOcean ? 34.f : 22.f;
+		// SWELL SCALES WITH THE BODY OF WATER. A 10 km ocean does not carry
+		// the same wave lengths as a 200 m lake, and a fixed 34 m made the
+		// open sea look like a pond at the wrong scale.
+		R.BaseLen = FMath::Clamp(SizeM * 0.010f, 18.f, 160.f);
 		// Straight from the level: EnableFoam gates it, and a level that
 		// authors FoamMaxValue 0 genuinely wants none.
 		R.FoamThreshold = S.FoamThreshold;
@@ -1481,21 +1496,50 @@ namespace
 			MID->SetScalarParameterValue(TEXT("WaveBaseLen"), Waves->BaseLen);
 			MID->SetScalarParameterValue(TEXT("FoamThreshold"), Waves->FoamThreshold);
 			MID->SetScalarParameterValue(TEXT("FoamMax"), Waves->FoamMax);
+			MID->SetScalarParameterValue(TEXT("MinDispLen"), Waves->VertexSpacingM * 3.f);
 		}
-		FLinearColor Shallow = W.Shallow.R >= 0.f ? W.Shallow : FLinearColor(0.11f, 0.34f, 0.36f);
-		FLinearColor Deep    = W.Deep.R    >= 0.f ? W.Deep
-			: FLinearColor(Shallow.R * 0.25f, Shallow.G * 0.25f, Shallow.B * 0.35f);
-		const float Fade = W.bOcean ? 18.f : 12.f;   // metres to the deep colour
+		// THE GAME'S OWN COLOUR CONVERSION.
+		//
+		// The recovered water pixel shader computes its albedo as
+		//     saturate(1 + ln(c) / d)
+		// which is an inverse Beer-Lambert: c is the colour the water should
+		// REACH after d metres, and the expression recovers the per-unit
+		// transmission. For Single Layer Water the quantity wanted is the
+		// EXTINCTION, which is the same log over the same distance without
+		// the 1 + : -ln(c)/d. An earlier version of this function invented a
+		// mapping from the deep colour instead and produced neutral grey,
+		// because taking logs of three similar dark numbers gives three
+		// similar large numbers - and equal absorption in RGB is, by
+		// definition, grey.
+		//
+		// Water absorbs red far more than blue, so a correct extinction is
+		// strongly UNEQUAL across the channels. Aftermath's authored colour
+		// (0, 0.076, 0.082) gives roughly (0.92, 0.26, 0.25) at d = 10: red
+		// gone in a metre, blue-green carrying, which is what a sea looks
+		// like.
+		FLinearColor C = W.Shallow.R >= 0.f ? W.Shallow : FLinearColor(0.02f, 0.20f, 0.24f);
+		const float D = AbsorptionDistanceM;
+		auto Ext = [D](float c) {
+			// clamp only against log(0); do NOT clamp the top, or a dark
+			// authored channel is lifted into the others and the tint dies.
+			return -FMath::Loge(FMath::Max(c, 1e-4f)) / FMath::Max(D, 0.5f);
+		};
+		MID->SetVectorParameterValue(TEXT("Absorption"),
+			FLinearColor(Ext(C.R), Ext(C.G), Ext(C.B)));
+		// Scattering is what the body of the water throws back. Tinted like
+		// the authored colour but weak: the sea's brightness comes from the
+		// sky reflection, not from the volume.
 		MID->SetVectorParameterValue(TEXT("Scattering"), FLinearColor(
-			FMath::Max(Shallow.R, 0.002f) * 0.09f,
-			FMath::Max(Shallow.G, 0.002f) * 0.09f,
-			FMath::Max(Shallow.B, 0.002f) * 0.09f));
-		MID->SetVectorParameterValue(TEXT("Absorption"), FLinearColor(
-			-FMath::Loge(FMath::Clamp(Deep.R, 0.01f, 0.95f)) / Fade,
-			-FMath::Loge(FMath::Clamp(Deep.G, 0.01f, 0.95f)) / Fade,
-			-FMath::Loge(FMath::Clamp(Deep.B, 0.01f, 0.95f)) / Fade));
+			FMath::Max(C.R, 0.002f) * 0.35f,
+			FMath::Max(C.G, 0.002f) * 0.35f,
+			FMath::Max(C.B, 0.002f) * 0.35f));
 		return MID;
 	}
+
+	// Metres over which the authored colour is reached. The game carries this
+	// per material (CB1[0].w); we have no reader for it yet, so it is one
+	// number here rather than a guess dressed as data.
+	float AbsorptionDistanceM = 10.f;
 
 	int32 GWaterBuilt = 0;
 
@@ -1515,7 +1559,8 @@ namespace
 		for (int32 wi = 0; wi < W.Num(); wi++)
 		{
 			const BF6HP::FCore::FWater& S = W[wi];
-			const FWaveSet Waves = bHaveSim ? DeriveWaves(Sim, S.bOcean) : FWaveSet();
+			const float SizeM = (float)FMath::Max(S.Size.X, S.Size.Y);
+			FWaveSet Waves = bHaveSim ? DeriveWaves(Sim, S.bOcean, SizeM) : FWaveSet();
 			// A GRID DENSE ENOUGH TO DISPLACE. The Gerstner offset moves
 			// vertices, so vertex spacing is the wave resolution: 12 m steps
 			// give the ratio-1 swell (26-34 m) three-plus vertices per length,
@@ -1523,7 +1568,15 @@ namespace
 			// Capped at 512 a side - half a million triangles for a 10 km sea,
 			// which draws fine without Nanite and never fights WPO.
 			const int32 N = FMath::Clamp(
-				(int32)(FMath::Max(S.Size.X, S.Size.Y) / 12.0), 64, 512);
+				(int32)(FMath::Max(S.Size.X, S.Size.Y) / 12.0), 64, 1024);
+			// WHAT THE GRID CAN ACTUALLY CARRY. A wave shorter than a few
+			// vertex spacings cannot be represented as geometry: sampled at
+			// under two vertices per wavelength it does not become a small
+			// wave, it becomes NOISE. On a 10 km ocean at 1024 a side that
+			// is a vertex every 9.8 m, so anything under about 30 m has to
+			// live in the per-pixel normal instead. This number is what the
+			// material gates displacement on.
+			Waves.VertexSpacingM = (float)(FMath::Max(S.Size.X, S.Size.Y) / (double)N);
 			FMeshDescription MD;
 			FStaticMeshAttributes Attr(MD);
 			Attr.Register();
