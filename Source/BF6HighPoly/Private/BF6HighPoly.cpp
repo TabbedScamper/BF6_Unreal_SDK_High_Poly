@@ -76,6 +76,14 @@ namespace
 	BF6HP::FCore GCore;
 	FString      GStatus = TEXT("");
 	int32        GLastCount = 0;
+	// DID THE BUILD PRODUCE ANYTHING AT ALL.
+	//
+	// Not the same question as GLastCount, which counts placed OBJECT
+	// instances only. A creator who turns every layer off except Water gets
+	// a map with water and no objects: GLastCount is 0, and anything gated
+	// on it then hides the water that was just built, reports "nothing yet",
+	// and greys out CLEAR. Every layer that can build sets this instead.
+	bool         GBuiltAnything = false;
 
 	// The game is Y-up in metres; Unreal is Z-up in centimetres. Swapping Y and
 	// Z is what carries a placement across, and the scale is the unit change.
@@ -924,7 +932,7 @@ namespace
 	// The low-poly map is the tool's, so it is asked rather than reached into.
 	void ApplyLowPoly()
 	{
-		BF6Ext::SetLowPolyMapHidden(GHideLowPoly && GLastCount > 0);
+		BF6Ext::SetLowPolyMapHidden(GHideLowPoly && GBuiltAnything);
 	}
 
 	// How finely the ground is rebuilt.
@@ -1094,6 +1102,7 @@ namespace
 			Built++;
 		}
 		GTerrainTilesBuilt = Built;
+		if (Built > 0) GBuiltAnything = true;
 		return N;
 	}
 
@@ -1640,6 +1649,7 @@ namespace
 			C->SetCollisionEnabled(ECollisionEnabled::NoCollision);
 			C->SetCastShadow(false);
 			GWaterBuilt++;
+			GBuiltAnything = true;
 		}
 		return GWaterBuilt;
 	}
@@ -1687,7 +1697,7 @@ namespace
 		UWorld* W = GEditor->GetEditorWorldContext().World();
 		if (!W) return;
 		const FName Owner(*(FString(TEXT("addon:")) + kAddonName));
-		const bool bShowHigh = GMode != EMode::LowPoly && GLastCount > 0;
+		const bool bShowHigh = GMode != EMode::LowPoly && GBuiltAnything;
 		const bool bClay = GMode == EMode::Clay;
 
 		for (TActorIterator<AActor> It(W); It; ++It)
@@ -1716,7 +1726,7 @@ namespace
 		}
 		// LOW-POLY shows the tool's map regardless of the hide option; the
 		// other rungs honour it.
-		BF6Ext::SetLowPolyMapHidden(GMode != EMode::LowPoly && GHideLowPoly && GLastCount > 0);
+		BF6Ext::SetLowPolyMapHidden(GMode != EMode::LowPoly && GHideLowPoly && GBuiltAnything);
 	}
 
 
@@ -1845,6 +1855,7 @@ namespace
 			C->SetCollisionEnabled(ECollisionEnabled::NoCollision);
 			C->SetCastShadow(false);          // paint on the ground casts none
 			GRoadRecords++;
+			GBuiltAnything = true;
 			GRoadTris += nv / 3;
 		}
 		return GRoadRecords;
@@ -1863,6 +1874,7 @@ namespace
 		if (!W) return 0;
 
 		BF6Ext::ClearAddonActors(kAddonName);
+		GBuiltAnything = false;
 
 		// Group the placements by asset - AND by variation, where the
 		// variation earns it. A livery or a paint is a variant depot record,
@@ -2089,6 +2101,7 @@ namespace
 				}
 				H->AddInstances(Xf, false);
 				Placed += Xf.Num();
+				if (Xf.Num() > 0) GBuiltAnything = true;
 			}
 		}
 
@@ -2556,7 +2569,7 @@ namespace
 					+ SVerticalBox::Slot().AutoHeight().Padding(0, 0, 0, 10)
 					[ Row(TEXT("Cache"), CacheDir(), true) ]
 					+ SVerticalBox::Slot().AutoHeight().Padding(0, 0, 0, 8)
-					[ Row(TEXT("Last read"), GStatus.IsEmpty() ? TEXT("nothing yet") : GStatus, GLastCount > 0) ]
+					[ Row(TEXT("Last read"), GStatus.IsEmpty() ? TEXT("nothing yet") : GStatus, GBuiltAnything) ]
 
 					// ---- mode, layers and options, all pills --------------
 					+ SVerticalBox::Slot().AutoHeight().Padding(0, 4, 0, 4)
@@ -2612,17 +2625,18 @@ namespace
 							.IsEnabled_Lambda([]{ return !BF6Ext::CurrentLevel().IsEmpty(); })
 							.OnClicked_Lambda([]{ StartRead(); return FReply::Handled(); })
 							[ SNew(STextBlock).Text_Lambda([]
-								{ return GLastCount > 0 ? LOCTEXT("Rebuild", "REBUILD") : LOCTEXT("Read", "BUILD FROM THE GAME"); }) ]
+								{ return GBuiltAnything ? LOCTEXT("Rebuild", "REBUILD") : LOCTEXT("Read", "BUILD FROM THE GAME"); }) ]
 						]
 						+ SHorizontalBox::Slot().AutoWidth()
 						[
 							SNew(SButton)
 							.ContentPadding(FMargin(12.f, 6.f))
-							.IsEnabled_Lambda([]{ return GLastCount > 0; })
+							.IsEnabled_Lambda([]{ return GBuiltAnything; })
 							.OnClicked_Lambda([]
 							{
 								BF6Ext::ClearAddonActors(kAddonName);
 								GLastCount = 0;
+								GBuiltAnything = false;
 								GStatus = TEXT("cleared");
 								ApplyLowPoly();     // and the low-poly map comes back
 								return FReply::Handled();
@@ -2714,7 +2728,7 @@ void FBF6HighPolyModule::StartupModule()
 		{
 			BF6Ext::FPieSubEntry E;
 			E.Label = TEXT("BUILD");
-			E.Sub = []{ return FString(GLastCount > 0
+			E.Sub = []{ return FString(GBuiltAnything
 				? TEXT("rebuild from the game") : TEXT("read your install")); };
 			E.OnPick = []{ StartRead(); };
 			E.bCloses = true;
