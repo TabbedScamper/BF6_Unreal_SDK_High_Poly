@@ -173,6 +173,20 @@ namespace BF6HP
 		};
 		bool ReadDecals(const FString& Level, TArray<FDecal>& Out);
 
+		// One water surface: a flat plane at an absolute height, with the
+		// colours the level's own record authors. Shallow.R < 0 = no mined
+		// colour, use a preset. Ocean authors ONE colour; Deep stays absent.
+		struct FWater
+		{
+			FVector2D    Center = FVector2D::ZeroVector;   // game X, Z
+			FVector2D    Size   = FVector2D::ZeroVector;   // metres
+			float        Height = 0.f;                     // game Y
+			FLinearColor Shallow = FLinearColor(-1.f, 0.f, 0.f);
+			FLinearColor Deep    = FLinearColor(-1.f, 0.f, 0.f);
+			bool         bOcean = false;
+		};
+		bool ReadWater(const FString& Level, TArray<FWater>& Out);
+
 		static FString MeshResourceFor(const FString& PlacementPath);
 
 		FString Error;

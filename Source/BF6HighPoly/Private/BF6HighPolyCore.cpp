@@ -23,6 +23,7 @@ namespace
 	typedef void (*FnSetProgress)(bf6_ctx*, bf6_progress_fn, void*);
 	typedef bf6_mesh* (*FnReadMeshScoped)(bf6_ctx*, const char*, int, const char*, const char*);
 	typedef const bf6_texture* (*FnTextureAt)(bf6_ctx*, int);
+	typedef int (*FnWater)(bf6_ctx*, const char*, bf6_water*, int);
 	typedef int (*FnDecals)(bf6_ctx*, const char*, bf6_decal*, int);
 
 	FnOpen      GOpen      = nullptr;
@@ -36,6 +37,7 @@ namespace
 	FnSetProgress GSetProgress = nullptr;
 	FnReadMeshScoped GReadScoped = nullptr;
 	FnTextureAt GTextureAt = nullptr;
+	FnWater     GWater     = nullptr;
 
 	// The C callback the core drives. Stores and returns; no UI, no allocation
 	// beyond the string, because this runs on the core's worker threads.
@@ -77,6 +79,7 @@ bool FCore::Open(const FString& GameDir, const FString& DllPath)
 	GSetProgress = (FnSetProgress) FPlatformProcess::GetDllExport(Dll, TEXT("bf6_set_progress"));
 	GReadScoped  = (FnReadMeshScoped) FPlatformProcess::GetDllExport(Dll, TEXT("bf6_read_mesh_scoped"));
 	GTextureAt   = (FnTextureAt) FPlatformProcess::GetDllExport(Dll, TEXT("bf6_texture_at"));
+	GWater       = (FnWater)     FPlatformProcess::GetDllExport(Dll, TEXT("bf6_level_water"));
 	if (!GOpen || !GOpenLevel || !GInstances)
 	{
 		// The tool ships a core too, and an older one has no bf6_open_level.
@@ -268,6 +271,36 @@ bool FCore::ReadDecals(const FString& Level, TArray<FDecal>& Out)
 	return Out.Num() > 0;
 }
 
+
+bool FCore::ReadWater(const FString& Level, TArray<FWater>& Out)
+{
+	Out.Reset();
+	Error.Reset();
+	// Same contract as the decals: an older core without the entry point means
+	// no water, which is what the add-on did until now anyway.
+	if (!Ctx || !GWater) return false;
+
+	const int32 n = GWater(Ctx, TCHAR_TO_UTF8(*Level), nullptr, 0);
+	if (n <= 0) return false;
+
+	TArray<bf6_water> Raw;
+	Raw.SetNumUninitialized(n);
+	const int32 got = GWater(Ctx, TCHAR_TO_UTF8(*Level), Raw.GetData(), n);
+	Out.Reserve(got);
+	for (int32 i = 0; i < got; i++)
+	{
+		const bf6_water& r = Raw[i];
+		FWater w;
+		w.Center = FVector2D(r.center[0], r.center[1]);
+		w.Size   = FVector2D(r.size[0], r.size[1]);
+		w.Height = r.height;
+		if (r.shallow[0] >= 0.f) w.Shallow = FLinearColor(r.shallow[0], r.shallow[1], r.shallow[2]);
+		if (r.deep[0]    >= 0.f) w.Deep    = FLinearColor(r.deep[0], r.deep[1], r.deep[2]);
+		w.bOcean = r.is_ocean != 0;
+		Out.Add(w);
+	}
+	return Out.Num() > 0;
+}
 
 bool FCore::TextureAt(int32 Id, FTexture& Out)
 {

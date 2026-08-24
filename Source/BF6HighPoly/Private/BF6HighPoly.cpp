@@ -26,6 +26,12 @@
 #include "Materials/MaterialExpressionConstantBiasScale.h"
 #include "Materials/MaterialExpressionDeriveNormalZ.h"
 #include "Materials/MaterialExpressionOneMinus.h"
+#include "Materials/MaterialExpressionMaterialFunctionCall.h"
+#include "Materials/MaterialExpressionSingleLayerWaterMaterialOutput.h"
+#include "Materials/MaterialFunction.h"
+#include "UObject/UObjectIterator.h"
+#include "Brushes/SlateRoundedBoxBrush.h"
+#include "Widgets/Layout/SWrapBox.h"
 #include "MaterialDomain.h"
 #include "MaterialEditingLibrary.h"
 #include "UObject/Package.h"
@@ -471,6 +477,47 @@ namespace
 			UMaterialEditingLibrary::ConnectMaterialProperty(Rough, TEXT(""), MP_Roughness);
 		}
 
+		// WIND, on the vegetation parent only, off until the pill asks.
+		//
+		// The Godot plugin learned this the expensive way: its first wind
+		// swap replaced the whole leaf material and downgraded every tree
+		// even with wind OFF. Here the sway is a WorldPositionOffset branch
+		// on the SAME material, gated by a scalar that defaults to zero - at
+		// zero the offset is exactly nothing and the material is unchanged.
+		if (Kind == EKind::MaskedVeg)
+		{
+			UMaterialFunction* GrassWind = LoadObject<UMaterialFunction>(nullptr,
+				TEXT("/Engine/Functions/Engine_MaterialFunctions01/WorldPositionOffset/SimpleGrassWind.SimpleGrassWind"));
+			UMaterialExpressionMaterialFunctionCall* Call = GrassWind
+				? Cast<UMaterialExpressionMaterialFunctionCall>(
+					UMaterialEditingLibrary::CreateMaterialExpression(
+						M, UMaterialExpressionMaterialFunctionCall::StaticClass(), -400, 900))
+				: nullptr;
+			if (Call)
+			{
+				Call->SetMaterialFunction(GrassWind);
+				UMaterialExpressionScalarParameter* WInt =
+					Cast<UMaterialExpressionScalarParameter>(
+						UMaterialEditingLibrary::CreateMaterialExpression(
+							M, UMaterialExpressionScalarParameter::StaticClass(), -700, 860));
+				UMaterialExpressionScalarParameter* WSpd =
+					Cast<UMaterialExpressionScalarParameter>(
+						UMaterialEditingLibrary::CreateMaterialExpression(
+							M, UMaterialExpressionScalarParameter::StaticClass(), -700, 940));
+				if (WInt && WSpd)
+				{
+					WInt->ParameterName = TEXT("WindIntensity");
+					WInt->DefaultValue = 0.f;
+					WSpd->ParameterName = TEXT("WindSpeed");
+					WSpd->DefaultValue = 1.f;
+					UMaterialEditingLibrary::ConnectMaterialExpressions(WInt, TEXT(""), Call, TEXT("WindIntensity"));
+					UMaterialEditingLibrary::ConnectMaterialExpressions(WInt, TEXT(""), Call, TEXT("WindWeight"));
+					UMaterialEditingLibrary::ConnectMaterialExpressions(WSpd, TEXT(""), Call, TEXT("WindSpeed"));
+					UMaterialEditingLibrary::ConnectMaterialProperty(Call, TEXT(""), MP_WorldPositionOffset);
+				}
+			}
+		}
+
 		// THE CUTOUT COMES FROM ITS OWN SHEET, not from the base colour's
 		// alpha. A "_cs" base colour's alpha is SMOOTHNESS, which is why
 		// cutouts ship as separate single-channel sheets - masking by the base
@@ -821,7 +868,7 @@ namespace
 	// point of it is that a creator can take the real world apart while looking
 	// at it. Only layers that actually exist are listed: an inert switch for
 	// something unported would be a lie told in the interface.
-	enum class ELayer : uint8 { Terrain, Roads, Objects, Count };
+	enum class ELayer : uint8 { Terrain, Roads, Objects, Water, Count };
 
 	struct FLayer
 	{
@@ -834,6 +881,7 @@ namespace
 		{ TEXT("Terrain"), TEXT("The real ground, at the shape the game ships. Preview only: it is never saved into your map or exported.") },
 		{ TEXT("Roads"), TEXT("Lane markings, crossings, mud and wear, draped on the ground. The road surface itself is the terrain; this is what is painted on it.") },
 		{ TEXT("Objects"), TEXT("Every prop, building and fixture the level places, at its real transform. Preview only.") },
+		{ TEXT("Water"), TEXT("The level's water surfaces, at the game's own heights and colours, drawn with Unreal's real water shading - depth absorption, reflections, refraction.") },
 	};
 
 	bool GHideLowPoly = true;
@@ -844,7 +892,8 @@ namespace
 	const TCHAR* LayerPrefix(ELayer L)
 	{
 		return L == ELayer::Terrain ? TEXT("Terrain")
-			 : L == ELayer::Roads   ? TEXT("RoadMesh_") : TEXT("I_");
+			 : L == ELayer::Roads   ? TEXT("RoadMesh_")
+			 : L == ELayer::Water   ? TEXT("Water_") : TEXT("I_");
 	}
 
 	void ApplyLayer(ELayer L)
@@ -1086,6 +1135,261 @@ namespace
 		     + H(x0, z1) * (1 - tx) * tz       + H(x1, z1) * tx * tz;
 	}
 
+	// ---- water ----------------------------------------------------------
+	//
+	// Its own parent rather than a seventh EKind: water is not a per-section
+	// material - it is Unreal's Single Layer Water shading model, which wants
+	// an opaque blend and a dedicated output node, and none of the generic
+	// texture parameters. The Godot plugin draws its water as a rippled quad
+	// with preset colours; here the engine does the real work - depth-based
+	// absorption and scattering, screen-space refraction, reflections - and
+	// the mined per-map colours drive the coefficients.
+	UMaterial* GWaterParent = nullptr;
+
+	UMaterial* EnsureWaterMaterial()
+	{
+		if (GWaterParent) return GWaterParent;
+		UPackage* Pkg = CreatePackage(TEXT("/Temp/BF6HighPoly_Water"));
+		if (!Pkg) return nullptr;
+		Pkg->SetFlags(RF_Transient);
+		UMaterial* M = NewObject<UMaterial>(Pkg, TEXT("M_BF6HighPoly_Water"), RF_Transient);
+		M->MaterialDomain = MD_Surface;
+		M->SetShadingModel(MSM_SingleLayerWater);
+		M->BlendMode = BLEND_Opaque;   // Single Layer Water IS opaque; depth is the shader's job
+
+		UMaterialExpressionSingleLayerWaterMaterialOutput* SLW =
+			Cast<UMaterialExpressionSingleLayerWaterMaterialOutput>(
+				UMaterialEditingLibrary::CreateMaterialExpression(
+					M, UMaterialExpressionSingleLayerWaterMaterialOutput::StaticClass(), 100, 300));
+		auto Vec = [&](const TCHAR* Name, FLinearColor Def, int32 Y)
+			-> UMaterialExpressionVectorParameter*
+		{
+			UMaterialExpressionVectorParameter* P =
+				Cast<UMaterialExpressionVectorParameter>(
+					UMaterialEditingLibrary::CreateMaterialExpression(
+						M, UMaterialExpressionVectorParameter::StaticClass(), -400, Y));
+			if (P) { P->ParameterName = Name; P->DefaultValue = Def; }
+			return P;
+		};
+		// Defaults are a believable lake; the per-plane instance overrides
+		// them from the mined record.
+		UMaterialExpressionVectorParameter* Scatter =
+			Vec(TEXT("Scattering"), FLinearColor(0.010f, 0.038f, 0.045f), 260);
+		UMaterialExpressionVectorParameter* Absorb =
+			Vec(TEXT("Absorption"), FLinearColor(0.30f, 0.115f, 0.085f), 360);
+		if (SLW && Scatter)
+			UMaterialEditingLibrary::ConnectMaterialExpressions(Scatter, TEXT(""), SLW, TEXT("ScatteringCoefficients"));
+		if (SLW && Absorb)
+			UMaterialEditingLibrary::ConnectMaterialExpressions(Absorb, TEXT(""), SLW, TEXT("AbsorptionCoefficients"));
+
+		// The SURFACE itself: near-black base so the body colour comes from
+		// the water volume, low roughness so the sky reflects.
+		UMaterialExpressionVectorParameter* Tint =
+			Vec(TEXT("SurfaceTint"), FLinearColor(0.008f, 0.011f, 0.012f), 60);
+		if (Tint) UMaterialEditingLibrary::ConnectMaterialProperty(Tint, TEXT(""), MP_BaseColor);
+		UMaterialExpressionScalarParameter* Rough =
+			Cast<UMaterialExpressionScalarParameter>(
+				UMaterialEditingLibrary::CreateMaterialExpression(
+					M, UMaterialExpressionScalarParameter::StaticClass(), -400, 160));
+		if (Rough)
+		{
+			Rough->ParameterName = TEXT("WaterRoughness");
+			Rough->DefaultValue = 0.04f;
+			UMaterialEditingLibrary::ConnectMaterialProperty(Rough, TEXT(""), MP_Roughness);
+		}
+
+		M->PreEditChange(nullptr);
+		M->PostEditChange();
+		UE_LOG(LogBF6HighPoly, Log, TEXT("water material: complete=%d"), M->IsComplete() ? 1 : 0);
+		GWaterParent = M;
+		return M;
+	}
+
+	// The coefficients, from the mined colours. Scattering IS the colour the
+	// water body shows, scaled to per-metre; absorption is what the DEEP
+	// colour is missing, spread over a fade depth. The ocean variant authors
+	// one colour and no deep - the reference consumer darkens for depth, and
+	// the same rule holds here.
+	UMaterialInstanceDynamic* WaterMaterialFor(UObject* Outer, const BF6HP::FCore::FWater& W)
+	{
+		UMaterial* Parent = EnsureWaterMaterial();
+		if (!Parent) return nullptr;
+		UMaterialInstanceDynamic* MID = UMaterialInstanceDynamic::Create(Parent, Outer);
+		if (!MID) return nullptr;
+		MID->SetFlags(RF_Transient);
+		FLinearColor Shallow = W.Shallow.R >= 0.f ? W.Shallow : FLinearColor(0.11f, 0.34f, 0.36f);
+		FLinearColor Deep    = W.Deep.R    >= 0.f ? W.Deep
+			: FLinearColor(Shallow.R * 0.25f, Shallow.G * 0.25f, Shallow.B * 0.35f);
+		const float Fade = W.bOcean ? 18.f : 12.f;   // metres to the deep colour
+		MID->SetVectorParameterValue(TEXT("Scattering"), FLinearColor(
+			FMath::Max(Shallow.R, 0.002f) * 0.09f,
+			FMath::Max(Shallow.G, 0.002f) * 0.09f,
+			FMath::Max(Shallow.B, 0.002f) * 0.09f));
+		MID->SetVectorParameterValue(TEXT("Absorption"), FLinearColor(
+			-FMath::Loge(FMath::Clamp(Deep.R, 0.01f, 0.95f)) / Fade,
+			-FMath::Loge(FMath::Clamp(Deep.G, 0.01f, 0.95f)) / Fade,
+			-FMath::Loge(FMath::Clamp(Deep.B, 0.01f, 0.95f)) / Fade));
+		return MID;
+	}
+
+	int32 GWaterBuilt = 0;
+
+	int32 BuildWater(AActor* A, USceneComponent* Root,
+	                 const TArray<BF6HP::FCore::FWater>& W, TArray<UStaticMesh*>& OutPending)
+	{
+		GWaterBuilt = 0;
+		for (int32 wi = 0; wi < W.Num(); wi++)
+		{
+			const BF6HP::FCore::FWater& S = W[wi];
+			// A GRID, NOT TWO TRIANGLES. Single Layer Water is fine on a flat
+			// quad, but a plane kilometres across as one polygon gives the
+			// depth fade almost no vertices to interpolate against and makes
+			// culling all-or-nothing. 32 x 32 is 2,048 triangles per surface -
+			// nothing - and gives the renderer something to work with.
+			const int32 N = 32;
+			FMeshDescription MD;
+			FStaticMeshAttributes Attr(MD);
+			Attr.Register();
+			TVertexAttributesRef<FVector3f>         VPos = Attr.GetVertexPositions();
+			TVertexInstanceAttributesRef<FVector2f> VUV  = Attr.GetVertexInstanceUVs();
+			const FPolygonGroupID Group = MD.CreatePolygonGroup();
+			Attr.GetPolygonGroupMaterialSlotNames()[Group] = TEXT("S0");
+
+			TArray<FVertexID> V;
+			V.SetNumUninitialized((N + 1) * (N + 1));
+			MD.ReserveNewVertices((N + 1) * (N + 1));
+			for (int32 gy = 0; gy <= N; gy++)
+				for (int32 gx = 0; gx <= N; gx++)
+				{
+					const double fx = (double)gx / N - 0.5, fz = (double)gy / N - 0.5;
+					const double gxw = S.Center.X + fx * S.Size.X;
+					const double gzw = S.Center.Y + fz * S.Size.Y;
+					const FVertexID id = MD.CreateVertex();
+					// game (x, y up, z) -> unreal (x, z, y up), metres -> cm
+					VPos[id] = FVector3f((float)(gxw * 100.0), (float)(gzw * 100.0),
+					                     (float)(S.Height * 100.0));
+					V[gy * (N + 1) + gx] = id;
+				}
+			auto Corner = [&](int32 gx, int32 gy) -> FVertexInstanceID
+			{
+				const FVertexInstanceID vi = MD.CreateVertexInstance(V[gy * (N + 1) + gx]);
+				VUV.Set(vi, 0, FVector2f((float)gx / N, (float)gy / N));
+				return vi;
+			};
+			for (int32 gy = 0; gy < N; gy++)
+				for (int32 gx = 0; gx < N; gx++)
+				{
+					// wound to face up after the axis swap, like the ground
+					MD.CreatePolygon(Group, TArray<FVertexInstanceID>{
+						Corner(gx, gy), Corner(gx + 1, gy + 1), Corner(gx + 1, gy) });
+					MD.CreatePolygon(Group, TArray<FVertexInstanceID>{
+						Corner(gx, gy), Corner(gx, gy + 1), Corner(gx + 1, gy + 1) });
+				}
+
+			FStaticMeshOperations::ComputeTriangleTangentsAndNormals(MD);
+			FStaticMeshOperations::ComputeTangentsAndNormals(MD, EComputeNTBsFlags::Normals);
+
+			UStaticMesh* SM = NewObject<UStaticMesh>(
+				A, *FString::Printf(TEXT("WaterMesh_%d"), wi), RF_Transient);
+			FStaticMaterial SMat;
+			SMat.MaterialSlotName = TEXT("S0");
+			SMat.ImportedMaterialSlotName = SMat.MaterialSlotName;
+			SMat.MaterialInterface = WaterMaterialFor(SM, S);
+			SM->GetStaticMaterials().Add(SMat);
+			// No Nanite: Single Layer Water and Nanite disagree, and 2,048
+			// triangles need no cluster hierarchy.
+			PrepareMesh(SM, MD, MD.Triangles().Num(), /*bAllowNanite*/ false);
+			OutPending.Add(SM);
+
+			UStaticMeshComponent* C = NewObject<UStaticMeshComponent>(
+				A, *FString::Printf(TEXT("Water_%d"), wi));
+			C->SetupAttachment(Root);
+			C->RegisterComponent();
+			C->SetStaticMesh(SM);
+			C->SetMobility(EComponentMobility::Static);
+			C->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+			C->SetCastShadow(false);
+			GWaterBuilt++;
+		}
+		return GWaterBuilt;
+	}
+
+	// ---- wind, clay and the mode ladder ----------------------------------
+
+	bool GWind = false;
+
+	// The pill acts on every LIVE vegetation instance; new ones are stamped at
+	// creation in MaterialFor. Iterating instances beats a registry that would
+	// dangle across rebuilds.
+	void ApplyWind()
+	{
+		for (TObjectIterator<UMaterialInstanceDynamic> It; It; ++It)
+			if (It->Parent == GParents[(int32)EKind::MaskedVeg])
+				It->SetScalarParameterValue(TEXT("WindIntensity"), GWind ? 1.f : 0.f);
+	}
+
+	// The three rungs, the Godot ladder translated. LOW-POLY is the tool's own
+	// map alone; CLAY is the real level in study grey; TEXTURED is the full
+	// thing. The user's placed pieces are the tool's actors and are never
+	// touched - only what THIS add-on built changes clothes.
+	enum class EMode : uint8 { LowPoly, Clay, Textured };
+	EMode GMode = EMode::Textured;
+
+	UMaterialInstanceDynamic* GClay = nullptr;
+
+	UMaterialInterface* ClayMaterial()
+	{
+		if (GClay) return GClay;
+		UMaterial* Parent = EnsureParentMaterial(EKind::Opaque);
+		if (!Parent) return nullptr;
+		GClay = UMaterialInstanceDynamic::Create(Parent, GetTransientPackage());
+		if (!GClay) return nullptr;
+		GClay->SetFlags(RF_Transient);
+		GClay->AddToRoot();   // outlives any one build
+		GClay->SetVectorParameterValue(TEXT("BaseColorTint"), FLinearColor(0.42f, 0.44f, 0.46f));
+		GClay->SetScalarParameterValue(TEXT("Roughness"), 0.85f);
+		return GClay;
+	}
+
+	void ApplyMode()
+	{
+		if (!GEditor) return;
+		UWorld* W = GEditor->GetEditorWorldContext().World();
+		if (!W) return;
+		const FName Owner(*(FString(TEXT("addon:")) + kAddonName));
+		const bool bShowHigh = GMode != EMode::LowPoly && GLastCount > 0;
+		const bool bClay = GMode == EMode::Clay;
+
+		for (TActorIterator<AActor> It(W); It; ++It)
+		{
+			if (!It->Tags.Contains(Owner)) continue;
+			It->SetIsTemporarilyHiddenInEditor(!bShowHigh);
+			TArray<UStaticMeshComponent*> Comps;
+			It->GetComponents<UStaticMeshComponent>(Comps);
+			for (UStaticMeshComponent* C : Comps)
+			{
+				if (!C) continue;
+				// Water keeps being water in clay: a grey sheet of ocean reads
+				// as a hole in the world, not as a study model.
+				if (C->GetName().StartsWith(TEXT("Water_"))) continue;
+				if (bClay)
+				{
+					if (UMaterialInterface* Grey = ClayMaterial())
+						for (int32 mi = 0; mi < C->GetNumMaterials(); mi++)
+							C->SetMaterial(mi, Grey);
+				}
+				else if (C->OverrideMaterials.Num() > 0)
+				{
+					C->EmptyOverrideMaterials();
+				}
+			}
+		}
+		// LOW-POLY shows the tool's map regardless of the hide option; the
+		// other rungs honour it.
+		BF6Ext::SetLowPolyMapHidden(GMode != EMode::LowPoly && GHideLowPoly && GLastCount > 0);
+	}
+
+
 	int32 BuildRoads(AActor* A, USceneComponent* Root, const BF6HP::FCore::FTerrain& T,
 	                 const TArray<BF6HP::FCore::FDecal>& D, TArray<UStaticMesh*>& OutPending)
 	{
@@ -1239,6 +1543,9 @@ namespace
 		ByMesh.GetKeys(Order);
 		Order.Sort([&ByMesh](const FString& a, const FString& b)
 			{ return ByMesh[a].Num() > ByMesh[b].Num(); });
+		// The pills only turn on what is needed, and OFF means not built, not
+		// merely hidden: a layer nobody asked for costs nothing.
+		if (!GLayers[(int32)ELayer::Objects].bOn) Order.Empty();
 
 		// WHERE THE TIME GOES, split so the levers are separable. Decoding, turning
 		// the decode into a mesh description, and Unreal's own build want
@@ -1264,10 +1571,13 @@ namespace
 		// one sampling a different surface from the one it sits on.
 		BF6HP::FCore::FTerrain Ground;
 		bool bHaveGround = false;
+		const bool bWantTerrain = GLayers[(int32)ELayer::Terrain].bOn;
+		const bool bWantRoads   = GLayers[(int32)ELayer::Roads].bOn;
+		if (bWantTerrain || bWantRoads)
 		{
 			if (Task) Task->EnterProgressFrame(3.f, LOCTEXT("Ground", "Building the ground"));
 			bHaveGround = GCore.ReadTerrain(BF6Ext::CurrentLevel(), Ground);
-			if (bHaveGround)
+			if (bHaveGround && bWantTerrain)
 			{
 				const int32 side = BuildTerrain(A, Root, Ground, Pending);
 				// Metres per vertex, not just the vertex count: the count alone says
@@ -1278,7 +1588,7 @@ namespace
 					TEXT("terrain: %d native -> %d built, %.0f m across at %.2f m per vertex, %d tile(s)"),
 					Ground.Size, side, Ground.WorldMax.X - Ground.WorldMin.X, MPerVert, GTerrainTilesBuilt);
 			}
-			else
+			else if (!bHaveGround)
 			{
 				UE_LOG(LogBF6HighPoly, Warning, TEXT("terrain: %s"), *GCore.Error);
 			}
@@ -1301,6 +1611,25 @@ namespace
 				// Not every level ships decals, and an older core has no entry
 				// point for them. Neither is a failure of the build.
 				UE_LOG(LogBF6HighPoly, Log, TEXT("roads: none for this level"));
+			}
+		}
+
+		// WATER. Flat planes at the level's own heights and colours, through
+		// Unreal's Single Layer Water - reflections and depth for free.
+		if (GLayers[(int32)ELayer::Water].bOn)
+		{
+			if (Task) Task->EnterProgressFrame(1.f, LOCTEXT("Water", "Laying the water"));
+			TArray<BF6HP::FCore::FWater> Water;
+			if (GCore.ReadWater(BF6Ext::CurrentLevel(), Water))
+			{
+				BuildWater(A, Root, Water, Pending);
+				UE_LOG(LogBF6HighPoly, Log, TEXT("water: %d surface(s)"), GWaterBuilt);
+			}
+			else
+			{
+				// Most levels author no water entity; some carry theirs in the
+				// backdrop instead. Neither is a failure of the build.
+				UE_LOG(LogBF6HighPoly, Log, TEXT("water: none for this level"));
 			}
 		}
 
@@ -1686,6 +2015,8 @@ namespace
 		GLastCount = BuildLevelGeometry(P, Meshes, Failed, &Task);
 		const double BuildS = FPlatformTime::Seconds() - T0;
 		ApplyLowPoly();
+		ApplyMode();
+		ApplyWind();
 		GStatus = FString::Printf(TEXT("%d of %d placements, %d mesh(es)%s, %.0fs%s"),
 			GLastCount, P.Num(), Meshes,
 			Failed ? *FString::Printf(TEXT(", %d unreadable"), Failed) : TEXT(""),
@@ -1694,22 +2025,67 @@ namespace
 		BF6Ext::Notify(FString::Printf(TEXT("High Poly: %s"), *GStatus));
 	}
 
-	// One layer, as a switch that acts immediately. No apply button: the whole
-	// point of a layer list is taking the world apart while looking at it.
-	TSharedRef<SWidget> LayerRow(ELayer L)
+	// ---- pills: the Godot dock's language --------------------------------
+	//
+	// Categories are rows, choices are pills, and a pill's fill says on. No
+	// checkboxes: the dock this mirrors is scanned and prodded, not read.
+	const FSlateBrush* PillBrush(bool bOn)
+	{
+		static FSlateRoundedBoxBrush On (FLinearColor(1.0f, 0.35f, 0.10f), 12.f);
+		static FSlateRoundedBoxBrush Off(FLinearColor(0.10f, 0.115f, 0.125f), 12.f,
+		                                 FLinearColor(0.28f, 0.31f, 0.33f), 1.f);
+		return bOn ? &On : &Off;
+	}
+
+	TSharedRef<SWidget> Pill(const FString& Label, TAttribute<bool> On,
+	                         TFunction<void()> OnClick, const FString& Hint)
+	{
+		return SNew(SButton).ButtonStyle(&FCoreStyle::Get(), "NoBorder").ContentPadding(FMargin(0, 0, 6, 6))
+			.ToolTipText(FText::FromString(Hint))
+			.OnClicked_Lambda([OnClick]{ if (OnClick) OnClick(); return FReply::Handled(); })
+			[
+				SNew(SBorder)
+				.BorderImage_Lambda([On]{ return PillBrush(On.Get(false)); })
+				.Padding(FMargin(12.f, 5.f))
+				[
+					SNew(STextBlock)
+					.Font(FCoreStyle::GetDefaultFontStyle("Bold", 9))
+					.Text(FText::FromString(Label.ToUpper()))
+					.ColorAndOpacity_Lambda([On]{ return FSlateColor(On.Get(false)
+						? FLinearColor(0.05f, 0.05f, 0.05f)
+						: FLinearColor(0.75f, 0.79f, 0.82f)); })
+				]
+			];
+	}
+
+	TSharedRef<SWidget> CategoryLabel(const FText& Label)
+	{
+		return SNew(STextBlock).Text(Label)
+			.Font(FCoreStyle::GetDefaultFontStyle("Regular", 8))
+			.ColorAndOpacity(FSlateColor(FLinearColor(0.46f, 0.51f, 0.54f)));
+	}
+
+	// A layer pill acts immediately on what is built, and before a build it is
+	// the order form: only what is on gets read and built at all.
+	TSharedRef<SWidget> LayerPill(ELayer L)
 	{
 		const int32 i = (int32)L;
-		return SNew(SCheckBox)
-			.IsChecked_Lambda([i]{ return GLayers[i].bOn ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
-			.IsEnabled_Lambda([]{ return GLastCount > 0; })
-			.OnCheckStateChanged_Lambda([i, L](ECheckBoxState S)
+		return Pill(GLayers[i].Name,
+			TAttribute<bool>::CreateLambda([i]{ return GLayers[i].bOn; }),
+			[i, L]
 			{
-				GLayers[i].bOn = (S == ECheckBoxState::Checked);
+				GLayers[i].bOn = !GLayers[i].bOn;
 				ApplyLayer(L);
-			})
-			.ToolTipText(FText::FromString(GLayers[i].Hint))
-			[ SNew(STextBlock).Text(FText::FromString(GLayers[i].Name))
-				.ColorAndOpacity(FSlateColor(FLinearColor(0.75f, 0.79f, 0.82f))) ];
+			},
+			GLayers[i].Hint);
+	}
+
+	TSharedRef<SWidget> ModePill(EMode M, const FString& Label, const FString& Hint)
+	{
+		return Pill(Label,
+			TAttribute<bool>::CreateLambda([M]{ return GMode == M; }),
+			[M]{ GMode = M; ApplyMode(); },
+			Hint);
 	}
 
 	// First use: the add-on will not read anything until the creator has said
@@ -1829,37 +2205,50 @@ namespace
 					+ SVerticalBox::Slot().AutoHeight().Padding(0, 0, 0, 8)
 					[ Row(TEXT("Last read"), GStatus.IsEmpty() ? TEXT("nothing yet") : GStatus, GLastCount > 0) ]
 
-					// ---- the layers, each switched live -------------------
-					+ SVerticalBox::Slot().AutoHeight().Padding(0, 4, 0, 2)
-					[ SNew(STextBlock).Text(LOCTEXT("Layers", "LAYERS"))
-						.ColorAndOpacity(FSlateColor(FLinearColor(0.46f, 0.51f, 0.54f))) ]
+					// ---- mode, layers and options, all pills --------------
+					+ SVerticalBox::Slot().AutoHeight().Padding(0, 4, 0, 4)
+					[ CategoryLabel(LOCTEXT("Mode", "MODE")) ]
 					+ SVerticalBox::Slot().AutoHeight()
-					[ LayerRow(ELayer::Terrain) ]
+					[
+						SNew(SWrapBox).UseAllottedSize(true)
+						+ SWrapBox::Slot()[ ModePill(EMode::LowPoly, TEXT("Low-Poly"),
+							TEXT("Just your own map, the way it exports. Everything the add-on built hides.")) ]
+						+ SWrapBox::Slot()[ ModePill(EMode::Clay, TEXT("Clay"),
+							TEXT("The real level in study grey. Shapes and sightlines without the noise of textures.")) ]
+						+ SWrapBox::Slot()[ ModePill(EMode::Textured, TEXT("Textured"),
+							TEXT("The full thing: real geometry, real materials, real water.")) ]
+					]
+					+ SVerticalBox::Slot().AutoHeight().Padding(0, 6, 0, 4)
+					[ CategoryLabel(LOCTEXT("Layers", "LAYERS")) ]
 					+ SVerticalBox::Slot().AutoHeight()
-					[ LayerRow(ELayer::Objects) ]
-					+ SVerticalBox::Slot().AutoHeight().Padding(0, 2, 0, 0)
 					[
-						SNew(SCheckBox)
-						.IsChecked_Lambda([]{ return GNanite ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
-						.OnCheckStateChanged_Lambda([](ECheckBoxState S){ GNanite = (S == ECheckBoxState::Checked); })
-						.ToolTipText(LOCTEXT("NaniteTip", "Build the geometry as Nanite, so the map draws at a steady rate no matter how much of it is on screen. It makes the build itself slower, because Unreal's full mesh builder has to run for every distinct asset instead of the quick path. Takes effect on the next build."))
-						[ SNew(STextBlock).Text(LOCTEXT("Nanite", "Nanite (slower build, far better frame rate)"))
-							.ColorAndOpacity(FSlateColor(FLinearColor(0.75f, 0.79f, 0.82f))) ]
+						SNew(SWrapBox).UseAllottedSize(true)
+						+ SWrapBox::Slot()[ LayerPill(ELayer::Terrain) ]
+						+ SWrapBox::Slot()[ LayerPill(ELayer::Roads) ]
+						+ SWrapBox::Slot()[ LayerPill(ELayer::Objects) ]
+						+ SWrapBox::Slot()[ LayerPill(ELayer::Water) ]
 					]
-					+ SVerticalBox::Slot().AutoHeight().Padding(0, 2, 0, 10)
+					+ SVerticalBox::Slot().AutoHeight().Padding(0, 6, 0, 4)
+					[ CategoryLabel(LOCTEXT("Options", "OPTIONS")) ]
+					+ SVerticalBox::Slot().AutoHeight().Padding(0, 0, 0, 10)
 					[
-						SNew(SCheckBox)
-						.IsChecked_Lambda([]{ return GHideLowPoly ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
-						.OnCheckStateChanged_Lambda([](ECheckBoxState S)
-						{
-							GHideLowPoly = (S == ECheckBoxState::Checked);
-							ApplyLowPoly();
-						})
-						.ToolTipText(LOCTEXT("HideLowTip", "Hide the tool's own low-poly terrain and asset mesh while the real thing is drawn over it. The tool puts them straight back when this is off, or when the high-poly build is cleared."))
-						[ SNew(STextBlock).Text(LOCTEXT("HideLow", "Hide the low-poly map"))
-							.ColorAndOpacity(FSlateColor(FLinearColor(0.75f, 0.79f, 0.82f))) ]
+						SNew(SWrapBox).UseAllottedSize(true)
+						+ SWrapBox::Slot()
+						[ Pill(TEXT("Nanite"),
+							TAttribute<bool>::CreateLambda([]{ return GNanite; }),
+							[]{ GNanite = !GNanite; },
+							TEXT("Build the geometry as Nanite: slower build, far better frame rate. Takes effect on the next build.")) ]
+						+ SWrapBox::Slot()
+						[ Pill(TEXT("Wind"),
+							TAttribute<bool>::CreateLambda([]{ return GWind; }),
+							[]{ GWind = !GWind; ApplyWind(); },
+							TEXT("Foliage sways. A world-position-offset branch on the vegetation material - at rest it costs exactly nothing.")) ]
+						+ SWrapBox::Slot()
+						[ Pill(TEXT("Low-Poly Map"),
+							TAttribute<bool>::CreateLambda([]{ return !GHideLowPoly; }),
+							[]{ GHideLowPoly = !GHideLowPoly; ApplyMode(); },
+							TEXT("Keep the tool's own low-poly map visible under the real one.")) ]
 					]
-
 					+ SVerticalBox::Slot().AutoHeight().Padding(0, 0, 0, 6)
 					[
 						SNew(SHorizontalBox)
