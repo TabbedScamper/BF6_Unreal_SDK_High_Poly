@@ -1389,13 +1389,20 @@ namespace
 		// is a flat grey - indistinguishable from "the water data is wrong"
 		// unless somebody reads the log. Say it loudly, at Warning, with the
 		// consequence spelled out.
-		if (!M->IsComplete())
+		// UE_LOG expands to several statements, so it needs braces here: a
+		// braceless if/else around it does not compile.
+		if (!M->IsComplete() && !M->IsCompiling())
+		{
 			UE_LOG(LogBF6HighPoly, Warning,
 				TEXT("WATER MATERIAL FAILED TO COMPILE - the surface will draw as flat grey ")
-				TEXT("(Unreal's default material). Look for 'Failed to compile Material' above ")
-				TEXT("for the HLSL error."));
+				TEXT("(Unreal's default material). Search the log for 'Failed to compile Material' ")
+				TEXT("to find the HLSL error and the line it is on."));
+		}
 		else
-			UE_LOG(LogBF6HighPoly, Log, TEXT("water material: compiled"));
+		{
+			UE_LOG(LogBF6HighPoly, Log, TEXT("water material: %s"),
+				M->IsCompiling() ? TEXT("compiling") : TEXT("compiled"));
+		}
 		GWaterParent = M;
 		return M;
 	}
