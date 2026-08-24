@@ -194,6 +194,20 @@ namespace BF6HP
 		};
 		bool ReadWater(const FString& Level, TArray<FWater>& Out);
 
+		// The authored sea state: the ocean simulation's inputs. The wave
+		// FIELD is a runtime GPU sim and is not on disk; these numbers drive
+		// it. WindAngle is radians (axis convention unresolved), WindSpeed a
+		// normalised scalar, the distribution is wave energy by direction.
+		struct FWaterSim
+		{
+			float WindAngle = 0.f, WindSpeed = 0.f, Choppiness = 0.f;
+			float TileDimension = 0.f, MinWavelength = 0.f;
+			float LargeWaveReduction = 0.f, FoamThreshold = 0.f, FoamMax = 0.f;
+			bool  bFlagged = false;
+			TArray<FVector2D> Dist;   // x 0..1 = a turn around WindAngle, y = energy
+		};
+		bool ReadWaterSim(const FString& Level, FWaterSim& Out);
+
 		static FString MeshResourceFor(const FString& PlacementPath);
 
 		FString Error;

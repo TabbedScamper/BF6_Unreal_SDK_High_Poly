@@ -25,6 +25,7 @@ namespace
 	typedef const bf6_texture* (*FnTextureAt)(bf6_ctx*, int);
 	typedef int (*FnWater)(bf6_ctx*, const char*, bf6_water*, int);
 	typedef int (*FnVarLive)(bf6_ctx*, const char*, const char*, const char*);
+	typedef int (*FnWaterSim)(bf6_ctx*, const char*, bf6_water_sim*);
 	typedef int (*FnDecals)(bf6_ctx*, const char*, bf6_decal*, int);
 
 	FnOpen      GOpen      = nullptr;
@@ -40,6 +41,7 @@ namespace
 	FnTextureAt GTextureAt = nullptr;
 	FnWater     GWater     = nullptr;
 	FnVarLive   GVarLive   = nullptr;
+	FnWaterSim  GWaterSim  = nullptr;
 
 	// The C callback the core drives. Stores and returns; no UI, no allocation
 	// beyond the string, because this runs on the core's worker threads.
@@ -83,6 +85,7 @@ bool FCore::Open(const FString& GameDir, const FString& DllPath)
 	GTextureAt   = (FnTextureAt) FPlatformProcess::GetDllExport(Dll, TEXT("bf6_texture_at"));
 	GWater       = (FnWater)     FPlatformProcess::GetDllExport(Dll, TEXT("bf6_level_water"));
 	GVarLive     = (FnVarLive)   FPlatformProcess::GetDllExport(Dll, TEXT("bf6_variation_live"));
+	GWaterSim    = (FnWaterSim)  FPlatformProcess::GetDllExport(Dll, TEXT("bf6_level_water_sim"));
 	if (!GOpen || !GOpenLevel || !GInstances)
 	{
 		// The tool ships a core too, and an older one has no bf6_open_level.
@@ -274,6 +277,26 @@ bool FCore::ReadDecals(const FString& Level, TArray<FDecal>& Out)
 	return Out.Num() > 0;
 }
 
+
+bool FCore::ReadWaterSim(const FString& Level, FWaterSim& Out)
+{
+	Out = FWaterSim();
+	if (!Ctx || !GWaterSim) return false;
+	bf6_water_sim s{};
+	if (!GWaterSim(Ctx, TCHAR_TO_UTF8(*Level), &s)) return false;
+	Out.WindAngle = s.wind_angle;
+	Out.WindSpeed = s.wind_speed;
+	Out.Choppiness = s.choppiness;
+	Out.TileDimension = s.tile_dimension;
+	Out.MinWavelength = s.min_wavelength;
+	Out.LargeWaveReduction = s.large_wave_reduction;
+	Out.FoamThreshold = s.foam_threshold;
+	Out.FoamMax = s.foam_max;
+	Out.bFlagged = s.enabled != 0;
+	for (int32 i = 0; i < s.dist_count && i < 13; i++)
+		Out.Dist.Add(FVector2D(s.dist_x[i], s.dist_y[i]));
+	return true;
+}
 
 bool FCore::VariationLive(const FString& ResName, const FString& Bundle,
                           const FString& Variation)

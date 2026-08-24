@@ -28,6 +28,9 @@
 #include "Materials/MaterialExpressionOneMinus.h"
 #include "Materials/MaterialExpressionMaterialFunctionCall.h"
 #include "Materials/MaterialExpressionSingleLayerWaterMaterialOutput.h"
+#include "Materials/MaterialExpressionCustom.h"
+#include "Materials/MaterialExpressionWorldPosition.h"
+#include "Materials/MaterialExpressionTime.h"
 #include "Materials/MaterialFunction.h"
 #include "UObject/UObjectIterator.h"
 #include "Brushes/SlateRoundedBoxBrush.h"
@@ -1198,6 +1201,103 @@ namespace
 			UMaterialEditingLibrary::ConnectMaterialProperty(Rough, TEXT(""), MP_Roughness);
 		}
 
+		// ---- THE WAVES: eight Gerstner components in one HLSL node --------
+		//
+		// The wave FIELD is a runtime simulation in the game and is not on
+		// disk; its INPUTS are, and they arrive through the instance's Wave0-7
+		// parameters (direction, relative amplitude, relative wavelength),
+		// derived from the map's own WindAngle, WindDistribution, WindSpeed
+		// and Choppiness. Displacement moves the vertices; the paired node
+		// rebuilds the analytic normal so the lighting follows the crests.
+		// Deep-water dispersion (speed = sqrt(g/k)) so long swells outrun the
+		// chop, which is most of what makes a sea read as one.
+		auto WaveInputs = [&](UMaterialExpressionCustom* X,
+		                      UMaterialExpressionWorldPosition* WP,
+		                      UMaterialExpressionTime* Tm,
+		                      UMaterialExpressionVectorParameter* Wv[8],
+		                      UMaterialExpressionScalarParameter* Gn,
+		                      UMaterialExpressionScalarParameter* Ch,
+		                      UMaterialExpressionScalarParameter* Bl)
+		{
+			X->Inputs.Empty();
+			auto In = [&X](const TCHAR* Nm, UMaterialExpression* E)
+			{
+				FCustomInput I;
+				I.InputName = Nm;
+				I.Input.Expression = E;
+				X->Inputs.Add(I);
+			};
+			In(TEXT("WPos"), WP);
+			In(TEXT("T"), Tm);
+			const TCHAR* Names[8] = { TEXT("W0"), TEXT("W1"), TEXT("W2"), TEXT("W3"),
+			                          TEXT("W4"), TEXT("W5"), TEXT("W6"), TEXT("W7") };
+			for (int32 i = 0; i < 8; i++) In(Names[i], Wv[i]);
+			In(TEXT("Gain"), Gn);
+			In(TEXT("Chop"), Ch);
+			In(TEXT("BaseLen"), Bl);
+		};
+
+		UMaterialExpressionWorldPosition* WP =
+			Cast<UMaterialExpressionWorldPosition>(
+				UMaterialEditingLibrary::CreateMaterialExpression(
+					M, UMaterialExpressionWorldPosition::StaticClass(), -900, 700));
+		UMaterialExpressionTime* Tm =
+			Cast<UMaterialExpressionTime>(
+				UMaterialEditingLibrary::CreateMaterialExpression(
+					M, UMaterialExpressionTime::StaticClass(), -900, 780));
+		UMaterialExpressionVectorParameter* Wv[8] = {};
+		for (int32 i = 0; i < 8; i++)
+		{
+			Wv[i] = Cast<UMaterialExpressionVectorParameter>(
+				UMaterialEditingLibrary::CreateMaterialExpression(
+					M, UMaterialExpressionVectorParameter::StaticClass(), -1150, 500 + 90 * i));
+			if (Wv[i])
+			{
+				Wv[i]->ParameterName = *FString::Printf(TEXT("Wave%d"), i);
+				// A default no-sea: zero amplitude, spread directions.
+				Wv[i]->DefaultValue = FLinearColor(1.f, 0.f, 0.f, 1.f);
+			}
+		}
+		auto Scal = [&](const TCHAR* Nm, float Def, int32 Y) -> UMaterialExpressionScalarParameter*
+		{
+			UMaterialExpressionScalarParameter* S =
+				Cast<UMaterialExpressionScalarParameter>(
+					UMaterialEditingLibrary::CreateMaterialExpression(
+						M, UMaterialExpressionScalarParameter::StaticClass(), -900, Y));
+			if (S) { S->ParameterName = Nm; S->DefaultValue = Def; }
+			return S;
+		};
+		UMaterialExpressionScalarParameter* Gn = Scal(TEXT("WaveGain"), 0.f, 860);
+		UMaterialExpressionScalarParameter* Ch = Scal(TEXT("WaveChop"), 0.4f, 920);
+		UMaterialExpressionScalarParameter* Bl = Scal(TEXT("WaveBaseLen"), 26.f, 980);
+
+		UMaterialExpressionCustom* WpoX =
+			Cast<UMaterialExpressionCustom>(
+				UMaterialEditingLibrary::CreateMaterialExpression(
+					M, UMaterialExpressionCustom::StaticClass(), -300, 760));
+		UMaterialExpressionCustom* NrmX =
+			Cast<UMaterialExpressionCustom>(
+				UMaterialEditingLibrary::CreateMaterialExpression(
+					M, UMaterialExpressionCustom::StaticClass(), -300, 980));
+		if (WpoX && NrmX && WP && Tm && Gn && Ch && Bl &&
+			Wv[0] && Wv[1] && Wv[2] && Wv[3] && Wv[4] && Wv[5] && Wv[6] && Wv[7])
+		{
+			WpoX->Code = TEXT("float3 disp = float3(0,0,0);\nfloat4 w[8] = {W0,W1,W2,W3,W4,W5,W6,W7};\nfloat2 pm = WPos.xy * 0.01;\nfor (int i = 0; i < 8; i++) {\n  float2 d = normalize(w[i].xy + float2(1e-5, 0));\n  float A = w[i].z * Gain;\n  float len = max(w[i].w * BaseLen, 1.0);\n  float k = 6.2831853 / len;\n  float ph = k * dot(d, pm) - sqrt(9.81 * k) * T;\n  disp.xy += d * (Chop * A) * cos(ph);\n  disp.z  += A * sin(ph);\n}\nreturn disp * 100.0;");
+			WpoX->OutputType = CMOT_Float3;
+			WpoX->Description = TEXT("BF6 Gerstner displacement");
+			WaveInputs(WpoX, WP, Tm, Wv, Gn, Ch, Bl);
+			UMaterialEditingLibrary::ConnectMaterialProperty(WpoX, TEXT(""), MP_WorldPositionOffset);
+
+			NrmX->Code = TEXT("float3 n = float3(0,0,1);\nfloat4 w[8] = {W0,W1,W2,W3,W4,W5,W6,W7};\nfloat2 pm = WPos.xy * 0.01;\nfor (int i = 0; i < 8; i++) {\n  float2 d = normalize(w[i].xy + float2(1e-5, 0));\n  float A = w[i].z * Gain;\n  float len = max(w[i].w * BaseLen, 1.0);\n  float k = 6.2831853 / len;\n  float ph = k * dot(d, pm) - sqrt(9.81 * k) * T;\n  float wa = k * A;\n  n.xy -= d * wa * cos(ph);\n  n.z  -= Chop * wa * sin(ph);\n}\nreturn normalize(n);");
+			NrmX->OutputType = CMOT_Float3;
+			NrmX->Description = TEXT("BF6 Gerstner normal");
+			WaveInputs(NrmX, WP, Tm, Wv, Gn, Ch, Bl);
+			UMaterialEditingLibrary::ConnectMaterialProperty(NrmX, TEXT(""), MP_Normal);
+			// The node writes a WORLD normal; the plane's tangent frame is not
+			// part of the math.
+			M->bTangentSpaceNormal = false;
+		}
+
 		M->PreEditChange(nullptr);
 		M->PostEditChange();
 		UE_LOG(LogBF6HighPoly, Log, TEXT("water material: complete=%d"), M->IsComplete() ? 1 : 0);
@@ -1205,18 +1305,105 @@ namespace
 		return M;
 	}
 
+	// The map's wave set, from its own simulation entity. Every rule here was
+	// learned in the Godot plugin the hard way and is ported, not re-derived:
+	// lobes are picked from WindDistribution by energy with a minimum angular
+	// separation; each lobe gets a FAN of components rather than one ray (two
+	// opposed rays of one wavelength are a STANDING wave and draw an egg-crate
+	// lattice - mp_dumbo's mirrored curve is exactly that case); the fan
+	// offsets step by the golden ratio so no two components are parallel; the
+	// wavelength ladder is powers of 1/phi so the sum's repeat period is
+	// pushed past anything a level holds.
+	struct FWaveSet
+	{
+		FLinearColor W[8];
+		float Gain = 0.f, Chop = 0.4f, BaseLen = 26.f;
+		bool  bValid = false;
+	};
+
+	FWaveSet DeriveWaves(const BF6HP::FCore::FWaterSim& S, bool bOcean)
+	{
+		static const float Ratio[8] = { 1.0f, 0.618f, 0.382f, 0.236f,
+		                                0.146f, 0.090f, 0.056f, 0.034f };
+		FWaveSet R;
+		for (int32 i = 0; i < 8; i++) R.W[i] = FLinearColor(1.f, 0.f, 0.f, Ratio[i]);
+
+		TArray<FVector2D> Lobes;
+		for (const FVector2D& pt : S.Dist)
+			if (pt.Y > 0.001f) Lobes.Add(pt);
+		Lobes.Sort([](const FVector2D& a, const FVector2D& b){ return a.Y > b.Y; });
+		TArray<FVector2D> Picked;
+		for (const FVector2D& l : Lobes)
+		{
+			bool bClash = false;
+			for (const FVector2D& q : Picked)
+			{
+				const float d = FMath::Abs(q.X - l.X);
+				if (FMath::Min(d, 1.f - d) < 0.06f) { bClash = true; break; }
+			}
+			if (!bClash) Picked.Add(l);
+			if (Picked.Num() >= 4) break;
+		}
+		if (Picked.Num() == 0) return R;
+
+		const float Top = FMath::Max(Picked[0].Y, 1e-4f);
+		int32 n = 0;
+		auto Fan = [&R, &n, &Ratio](float BaseAng, float Amp)
+		{
+			const float Off = FMath::DegreesToRadians(
+				46.f * (FMath::Fmod((float)n * 0.61803399f, 1.f) - 0.5f));
+			R.W[n] = FLinearColor(FMath::Cos(BaseAng + Off), FMath::Sin(BaseAng + Off),
+			                      Amp, Ratio[n]);
+			n++;
+		};
+		const int32 Per = FMath::Max(1, 8 / Picked.Num());
+		for (int32 li = 0; li < Picked.Num() && n < 8; li++)
+		{
+			const float Base = S.WindAngle + (Picked[li].X - 0.5f) * 2.f * PI;
+			for (int32 j = 0; j < Per && n < 8; j++)
+				Fan(Base, (Picked[li].Y / Top) * FMath::Pow(0.72f, (float)j));
+		}
+		float Tail = R.W[FMath::Max(n - 1, 0)].B;
+		while (n < 8)
+		{
+			Tail *= 0.72f;
+			Fan(S.WindAngle + (Picked[0].X - 0.5f) * 2.f * PI, Tail);
+		}
+
+		// WindSpeed -> amplitude, in METRES for the ratio-1 component. Square
+		// root, because the visible difference between 0.01 and 0.07 should
+		// not be a factor of seven in wave height; 0.07 is the windy neutral.
+		R.Gain = 0.35f * FMath::Clamp(
+			FMath::Sqrt(FMath::Max(S.WindSpeed, 0.f) / 0.07f), 0.40f, 2.20f);
+		// Choppiness -> crest sharpening, clamped below 1 or the phase warp
+		// folds crests into themselves.
+		R.Chop = FMath::Clamp(S.Choppiness, 0.05f, 0.9f);
+		R.BaseLen = bOcean ? 34.f : 22.f;
+		R.bValid = true;
+		return R;
+	}
+
 	// The coefficients, from the mined colours. Scattering IS the colour the
 	// water body shows, scaled to per-metre; absorption is what the DEEP
 	// colour is missing, spread over a fade depth. The ocean variant authors
 	// one colour and no deep - the reference consumer darkens for depth, and
 	// the same rule holds here.
-	UMaterialInstanceDynamic* WaterMaterialFor(UObject* Outer, const BF6HP::FCore::FWater& W)
+	UMaterialInstanceDynamic* WaterMaterialFor(UObject* Outer, const BF6HP::FCore::FWater& W,
+	                                           const FWaveSet* Waves)
 	{
 		UMaterial* Parent = EnsureWaterMaterial();
 		if (!Parent) return nullptr;
 		UMaterialInstanceDynamic* MID = UMaterialInstanceDynamic::Create(Parent, Outer);
 		if (!MID) return nullptr;
 		MID->SetFlags(RF_Transient);
+		if (Waves && Waves->bValid)
+		{
+			for (int32 i = 0; i < 8; i++)
+				MID->SetVectorParameterValue(*FString::Printf(TEXT("Wave%d"), i), Waves->W[i]);
+			MID->SetScalarParameterValue(TEXT("WaveGain"), Waves->Gain);
+			MID->SetScalarParameterValue(TEXT("WaveChop"), Waves->Chop);
+			MID->SetScalarParameterValue(TEXT("WaveBaseLen"), Waves->BaseLen);
+		}
 		FLinearColor Shallow = W.Shallow.R >= 0.f ? W.Shallow : FLinearColor(0.11f, 0.34f, 0.36f);
 		FLinearColor Deep    = W.Deep.R    >= 0.f ? W.Deep
 			: FLinearColor(Shallow.R * 0.25f, Shallow.G * 0.25f, Shallow.B * 0.35f);
@@ -1238,15 +1425,27 @@ namespace
 	                 const TArray<BF6HP::FCore::FWater>& W, TArray<UStaticMesh*>& OutPending)
 	{
 		GWaterBuilt = 0;
+		// One sim per level; every surface shares the sea state. bOcean below
+		// tunes only the base wavelength.
+		BF6HP::FCore::FWaterSim Sim;
+		const bool bHaveSim = GCore.ReadWaterSim(BF6Ext::CurrentLevel(), Sim);
+		if (bHaveSim)
+			UE_LOG(LogBF6HighPoly, Log,
+				TEXT("ocean sim: %s, angle %.2f, speed %.3f, chop %.2f, %d lobe point(s)"),
+				Sim.bFlagged ? TEXT("flagged") : TEXT("first"),
+				Sim.WindAngle, Sim.WindSpeed, Sim.Choppiness, Sim.Dist.Num());
 		for (int32 wi = 0; wi < W.Num(); wi++)
 		{
 			const BF6HP::FCore::FWater& S = W[wi];
-			// A GRID, NOT TWO TRIANGLES. Single Layer Water is fine on a flat
-			// quad, but a plane kilometres across as one polygon gives the
-			// depth fade almost no vertices to interpolate against and makes
-			// culling all-or-nothing. 32 x 32 is 2,048 triangles per surface -
-			// nothing - and gives the renderer something to work with.
-			const int32 N = 32;
+			const FWaveSet Waves = bHaveSim ? DeriveWaves(Sim, S.bOcean) : FWaveSet();
+			// A GRID DENSE ENOUGH TO DISPLACE. The Gerstner offset moves
+			// vertices, so vertex spacing is the wave resolution: 12 m steps
+			// give the ratio-1 swell (26-34 m) three-plus vertices per length,
+			// and the shorter components ride in the per-pixel normal instead.
+			// Capped at 512 a side - half a million triangles for a 10 km sea,
+			// which draws fine without Nanite and never fights WPO.
+			const int32 N = FMath::Clamp(
+				(int32)(FMath::Max(S.Size.X, S.Size.Y) / 12.0), 64, 512);
 			FMeshDescription MD;
 			FStaticMeshAttributes Attr(MD);
 			Attr.Register();
@@ -1294,7 +1493,7 @@ namespace
 			FStaticMaterial SMat;
 			SMat.MaterialSlotName = TEXT("S0");
 			SMat.ImportedMaterialSlotName = SMat.MaterialSlotName;
-			SMat.MaterialInterface = WaterMaterialFor(SM, S);
+			SMat.MaterialInterface = WaterMaterialFor(SM, S, &Waves);
 			SM->GetStaticMaterials().Add(SMat);
 			// No Nanite: Single Layer Water and Nanite disagree, and 2,048
 			// triangles need no cluster hierarchy.
