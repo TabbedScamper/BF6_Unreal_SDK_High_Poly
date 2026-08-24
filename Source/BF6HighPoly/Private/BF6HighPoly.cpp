@@ -33,6 +33,7 @@
 #include "Materials/MaterialExpressionTime.h"
 #include "Materials/MaterialExpressionLinearInterpolate.h"
 #include "Materials/MaterialExpressionConstant3Vector.h"
+#include "Materials/MaterialExpressionCameraPositionWS.h"
 #include "Materials/MaterialFunction.h"
 #include "UObject/UObjectIterator.h"
 #include "Brushes/SlateRoundedBoxBrush.h"
@@ -1248,6 +1249,8 @@ namespace
 			In(TEXT("Chop"), Ch);
 			In(TEXT("BaseLen"), Bl);
 			In(TEXT("MinLen"), Bl2);
+			In(TEXT("Detail"), Det);
+			In(TEXT("CamPos"), CamP);
 		};
 
 		UMaterialExpressionWorldPosition* WP =
@@ -1291,6 +1294,13 @@ namespace
 		// The shortest wavelength this water's GRID can represent, set per
 		// surface from its vertex spacing.
 		UMaterialExpressionScalarParameter* MnL = Scal(TEXT("MinDispLen"), 24.f, 1160);
+		// How pronounced the fine ripples are. Ours, not the game's - the
+		// game gets this detail from its simulation's normal cascades.
+		UMaterialExpressionScalarParameter* Det = Scal(TEXT("DetailRipple"), 1.f, 1220);
+		UMaterialExpressionCameraPositionWS* CamP =
+			Cast<UMaterialExpressionCameraPositionWS>(
+				UMaterialEditingLibrary::CreateMaterialExpression(
+					M, UMaterialExpressionCameraPositionWS::StaticClass(), -900, 840));
 
 		UMaterialExpressionCustom* WpoX =
 			Cast<UMaterialExpressionCustom>(
@@ -1300,7 +1310,7 @@ namespace
 			Cast<UMaterialExpressionCustom>(
 				UMaterialEditingLibrary::CreateMaterialExpression(
 					M, UMaterialExpressionCustom::StaticClass(), -300, 980));
-		if (WpoX && NrmX && WP && Tm && Gn && Ch && Bl && MnL &&
+		if (WpoX && NrmX && WP && Tm && Gn && Ch && Bl && MnL && Det && CamP &&
 			Wv[0] && Wv[1] && Wv[2] && Wv[3] && Wv[4] && Wv[5] && Wv[6] && Wv[7])
 		{
 			WpoX->Code = TEXT("// Each wave arrives as float3 (dir.x, dir.y, amplitude): a Custom\n// node takes a VectorParameter as float3, so asking for float4 here\n// is a compile error and a compile error is a GREY material.\nfloat3 w[8] = {W0,W1,W2,W3,W4,W5,W6,W7};\n// powers of 1/phi, so the sum does not repeat inside a level\nconst float ratio[8] = {1.0, 0.618, 0.382, 0.236, 0.146, 0.090, 0.056, 0.034};\nfloat2 pm = WPos.xy * 0.01;\nfloat3 disp = float3(0,0,0);\nfor (int i = 0; i < 8; i++) {\n  float len = max(ratio[i] * BaseLen, 0.5);\n  if (len < MinLen) continue;   // shorter than the grid can carry\n  float2 d = normalize(w[i].xy + float2(1e-5, 0));\n  float A = w[i].z * Gain;\n  float k = 6.2831853 / len;\n  float ph = k * dot(d, pm) - sqrt(9.81 * k) * T;\n  disp.xy += d * (Chop * A) * cos(ph);\n  disp.z  += A * sin(ph);\n}\nreturn disp * 100.0;");
@@ -1309,7 +1319,7 @@ namespace
 			WaveInputs(WpoX, WP, Tm, Wv, Gn, Ch, Bl, MnL);
 			UMaterialEditingLibrary::ConnectMaterialProperty(WpoX, TEXT(""), MP_WorldPositionOffset);
 
-			NrmX->Code = TEXT("// Each wave arrives as float3 (dir.x, dir.y, amplitude): a Custom\n// node takes a VectorParameter as float3, so asking for float4 here\n// is a compile error and a compile error is a GREY material.\nfloat3 w[8] = {W0,W1,W2,W3,W4,W5,W6,W7};\n// powers of 1/phi, so the sum does not repeat inside a level\nconst float ratio[8] = {1.0, 0.618, 0.382, 0.236, 0.146, 0.090, 0.056, 0.034};\nfloat2 pm = WPos.xy * 0.01;\nfloat3 n = float3(0,0,1);\nfor (int i = 0; i < 8; i++) {\n  float len = max(ratio[i] * BaseLen, 0.5);\n  float vis = saturate((len - 2.0) * 0.5);   // fade out sub-2 m detail\n  if (vis <= 0.0) continue;\n  float2 d = normalize(w[i].xy + float2(1e-5, 0));\n  float A = w[i].z * Gain * vis;\n  float k = 6.2831853 / len;\n  float ph = k * dot(d, pm) - sqrt(9.81 * k) * T;\n  float wa = k * A;\n  n.xy -= d * wa * cos(ph);\n  n.z  -= Chop * wa * sin(ph);\n}\nreturn normalize(n);");
+			NrmX->Code = TEXT("float3 w[8] = {W0,W1,W2,W3,W4,W5,W6,W7};\nconst float ratio[8] = {1.0, 0.618, 0.382, 0.236, 0.146, 0.090, 0.056, 0.034};\nfloat2 pm = WPos.xy * 0.01;\n// distance in metres, for fading detail the far field cannot resolve\nfloat dist = length(WPos - CamPos) * 0.01;\nfloat3 n = float3(0,0,1);\nfor (int i = 0; i < 8; i++) {\n  float len = max(ratio[i] * BaseLen, 0.5);\n  float2 d = normalize(w[i].xy + float2(1e-5, 0));\n  float A = w[i].z * Gain;\n  float k = 6.2831853 / len;\n  float ph = k * dot(d, pm) - sqrt(9.81 * k) * T;\n  float wa = k * A;\n  n.xy -= d * wa * cos(ph);\n  n.z  -= Chop * wa * sin(ph);\n}\n// THE RIPPLES. Six octaves from about four metres down to fifteen\n// centimetres, each turned off as it stops being resolvable so the\n// surface settles smoothly into the distance instead of boiling.\nfloat2 dirA = normalize(w[0].xy + float2(1e-5, 0));\nfloat2 dirB = float2(-dirA.y, dirA.x);\nfloat rlen = 4.0;\nfloat ramp = Detail * 0.06;\nfor (int j = 0; j < 6; j++) {\n  float fade = saturate(1.0 - dist / (rlen * 90.0));\n  if (fade > 0.001) {\n    float k2 = 6.2831853 / rlen;\n    float sp = sqrt(9.81 * k2);\n    float2 dd = normalize(dirA * (1.0 + 0.7 * float(j % 3)) + dirB * (0.5 - 0.35 * float(j % 2)));\n    float p2 = k2 * dot(dd, pm) - sp * T * 1.15;\n    float amp = ramp * fade;\n    n.xy -= dd * (k2 * amp) * cos(p2);\n  }\n  rlen *= 0.55;\n  ramp *= 0.72;\n}\nreturn normalize(n);");
 			NrmX->OutputType = CMOT_Float3;
 			NrmX->Description = TEXT("BF6 Gerstner normal");
 			WaveInputs(NrmX, WP, Tm, Wv, Gn, Ch, Bl, MnL);
@@ -1346,6 +1356,8 @@ namespace
 				In(TEXT("Chop"), Ch);
 				In(TEXT("BaseLen"), Bl);
 				In(TEXT("MinLen"), MnL);
+				In(TEXT("Detail"), Det);
+				In(TEXT("CamPos"), CamP);
 				In(TEXT("Thr"), FTh);
 				In(TEXT("Mx"), FMx);
 
@@ -1483,8 +1495,19 @@ namespace
 		// WindSpeed -> amplitude, in METRES for the ratio-1 component. Square
 		// root, because the visible difference between 0.01 and 0.07 should
 		// not be a factor of seven in wave height; 0.07 is the windy neutral.
-		R.Gain = 0.35f * FMath::Clamp(
-			FMath::Sqrt(FMath::Max(S.WindSpeed, 0.f) / 0.07f), 0.40f, 2.20f);
+		// AMPLITUDE, and why the first mapping produced a flat sea.
+		//
+		// WindSpeed is a normalised authoring scalar, not metres per second,
+		// and on the multiplayer maps it barely moves: 0.01 on the calm ones
+		// and 0.07 on the windy. Scaling a 0.35 m base by sqrt(0.01/0.07)
+		// gave 14 cm waves on a ten kilometre sea, which is invisible.
+		// Choppiness is the value that actually separates these maps (0.02 on
+		// Aftermath against 0.60 on Tungsten) so it carries most of the
+		// weight here, with wind speed as a multiplier on top.
+		R.Gain = FMath::Clamp(
+			(0.45f + 1.60f * FMath::Sqrt(FMath::Clamp(S.Choppiness, 0.f, 3.f))) *
+			FMath::Clamp(FMath::Sqrt(FMath::Max(S.WindSpeed, 0.f) / 0.07f), 0.55f, 2.2f),
+			0.30f, 4.0f);
 		// Choppiness -> crest sharpening, clamped below 1 or the phase warp
 		// folds crests into themselves.
 		R.Chop = FMath::Clamp(S.Choppiness, 0.05f, 0.9f);
