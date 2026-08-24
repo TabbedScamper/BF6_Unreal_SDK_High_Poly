@@ -1303,13 +1303,13 @@ namespace
 		if (WpoX && NrmX && WP && Tm && Gn && Ch && Bl && MnL &&
 			Wv[0] && Wv[1] && Wv[2] && Wv[3] && Wv[4] && Wv[5] && Wv[6] && Wv[7])
 		{
-			WpoX->Code = TEXT("// GATED BY WHAT THE GRID CAN CARRY.\n// A component shorter than MinDispLen cannot be represented by these\n// vertices - sampled at under two per wavelength it is not a small wave,\n// it is noise. Those components are dropped here and live in the normal\n// instead, which is exactly how the game splits it: displacement from\n// the long cascades, detail from normal maps.\nfloat3 disp = float3(0,0,0);\nfloat4 w[8] = {W0,W1,W2,W3,W4,W5,W6,W7};\nfloat2 pm = WPos.xy * 0.01;\nfor (int i = 0; i < 8; i++) {\n  float len = max(w[i].w * BaseLen, 0.5);\n  if (len < MinLen) continue;\n  float2 d = normalize(w[i].xy + float2(1e-5, 0));\n  float A = w[i].z * Gain;\n  float k = 6.2831853 / len;\n  float ph = k * dot(d, pm) - sqrt(9.81 * k) * T;\n  disp.xy += d * (Chop * A) * cos(ph);\n  disp.z  += A * sin(ph);\n}\nreturn disp * 100.0;");
+			WpoX->Code = TEXT("// Each wave arrives as float3 (dir.x, dir.y, amplitude): a Custom\n// node takes a VectorParameter as float3, so asking for float4 here\n// is a compile error and a compile error is a GREY material.\nfloat3 w[8] = {W0,W1,W2,W3,W4,W5,W6,W7};\n// powers of 1/phi, so the sum does not repeat inside a level\nconst float ratio[8] = {1.0, 0.618, 0.382, 0.236, 0.146, 0.090, 0.056, 0.034};\nfloat2 pm = WPos.xy * 0.01;\nfloat3 disp = float3(0,0,0);\nfor (int i = 0; i < 8; i++) {\n  float len = max(ratio[i] * BaseLen, 0.5);\n  if (len < MinLen) continue;   // shorter than the grid can carry\n  float2 d = normalize(w[i].xy + float2(1e-5, 0));\n  float A = w[i].z * Gain;\n  float k = 6.2831853 / len;\n  float ph = k * dot(d, pm) - sqrt(9.81 * k) * T;\n  disp.xy += d * (Chop * A) * cos(ph);\n  disp.z  += A * sin(ph);\n}\nreturn disp * 100.0;");
 			WpoX->OutputType = CMOT_Float3;
 			WpoX->Description = TEXT("BF6 Gerstner displacement");
 			WaveInputs(WpoX, WP, Tm, Wv, Gn, Ch, Bl, MnL);
 			UMaterialEditingLibrary::ConnectMaterialProperty(WpoX, TEXT(""), MP_WorldPositionOffset);
 
-			NrmX->Code = TEXT("// The normal carries the detail the geometry cannot, but not without\n// limit: a component around a metre long shimmers per pixel at any\n// distance and reads as static noise. Anything under two metres is\n// dropped, and each component is faded out as its wavelength\n// approaches that floor rather than vanishing in one step.\nfloat3 n = float3(0,0,1);\nfloat4 w[8] = {W0,W1,W2,W3,W4,W5,W6,W7};\nfloat2 pm = WPos.xy * 0.01;\nfor (int i = 0; i < 8; i++) {\n  float len = max(w[i].w * BaseLen, 0.5);\n  float vis = saturate((len - 2.0) * 0.5);\n  if (vis <= 0.0) continue;\n  float2 d = normalize(w[i].xy + float2(1e-5, 0));\n  float A = w[i].z * Gain * vis;\n  float k = 6.2831853 / len;\n  float ph = k * dot(d, pm) - sqrt(9.81 * k) * T;\n  float wa = k * A;\n  n.xy -= d * wa * cos(ph);\n  n.z  -= Chop * wa * sin(ph);\n}\nreturn normalize(n);");
+			NrmX->Code = TEXT("// Each wave arrives as float3 (dir.x, dir.y, amplitude): a Custom\n// node takes a VectorParameter as float3, so asking for float4 here\n// is a compile error and a compile error is a GREY material.\nfloat3 w[8] = {W0,W1,W2,W3,W4,W5,W6,W7};\n// powers of 1/phi, so the sum does not repeat inside a level\nconst float ratio[8] = {1.0, 0.618, 0.382, 0.236, 0.146, 0.090, 0.056, 0.034};\nfloat2 pm = WPos.xy * 0.01;\nfloat3 n = float3(0,0,1);\nfor (int i = 0; i < 8; i++) {\n  float len = max(ratio[i] * BaseLen, 0.5);\n  float vis = saturate((len - 2.0) * 0.5);   // fade out sub-2 m detail\n  if (vis <= 0.0) continue;\n  float2 d = normalize(w[i].xy + float2(1e-5, 0));\n  float A = w[i].z * Gain * vis;\n  float k = 6.2831853 / len;\n  float ph = k * dot(d, pm) - sqrt(9.81 * k) * T;\n  float wa = k * A;\n  n.xy -= d * wa * cos(ph);\n  n.z  -= Chop * wa * sin(ph);\n}\nreturn normalize(n);");
 			NrmX->OutputType = CMOT_Float3;
 			NrmX->Description = TEXT("BF6 Gerstner normal");
 			WaveInputs(NrmX, WP, Tm, Wv, Gn, Ch, Bl, MnL);
@@ -1328,7 +1328,7 @@ namespace
 						M, UMaterialExpressionCustom::StaticClass(), -300, 1160));
 			if (FoamX)
 			{
-				FoamX->Code = TEXT("// Folding, the way csWaterOceanDiff computes it: the divergence of the\n// horizontal displacement. BF6 applies that displacement with a MINUS\n// sign, so foam belongs on POSITIVE divergence - the other way round it\n// collects in the troughs. Only components that actually displace can\n// fold, so this uses the same gate as the displacement.\nfloat div = 0.0;\nfloat4 w[8] = {W0,W1,W2,W3,W4,W5,W6,W7};\nfloat2 pm = WPos.xy * 0.01;\nfor (int i = 0; i < 8; i++) {\n  float len = max(w[i].w * BaseLen, 0.5);\n  if (len < MinLen) continue;\n  float2 d = normalize(w[i].xy + float2(1e-5, 0));\n  float A = w[i].z * Gain;\n  float k = 6.2831853 / len;\n  float ph = k * dot(d, pm) - sqrt(9.81 * k) * T;\n  div += Chop * A * k * sin(ph);\n}\nreturn saturate(max(0.0, div - Thr * 0.02) * Mx);");
+				FoamX->Code = TEXT("// Each wave arrives as float3 (dir.x, dir.y, amplitude): a Custom\n// node takes a VectorParameter as float3, so asking for float4 here\n// is a compile error and a compile error is a GREY material.\nfloat3 w[8] = {W0,W1,W2,W3,W4,W5,W6,W7};\n// powers of 1/phi, so the sum does not repeat inside a level\nconst float ratio[8] = {1.0, 0.618, 0.382, 0.236, 0.146, 0.090, 0.056, 0.034};\nfloat2 pm = WPos.xy * 0.01;\n// the divergence of the horizontal displacement - BF6 applies it with a\n// MINUS sign, so foam belongs on POSITIVE divergence\nfloat div = 0.0;\nfor (int i = 0; i < 8; i++) {\n  float len = max(ratio[i] * BaseLen, 0.5);\n  if (len < MinLen) continue;\n  float2 d = normalize(w[i].xy + float2(1e-5, 0));\n  float A = w[i].z * Gain;\n  float k = 6.2831853 / len;\n  float ph = k * dot(d, pm) - sqrt(9.81 * k) * T;\n  div += Chop * A * k * sin(ph);\n}\nreturn saturate(max(0.0, div - Thr * 0.02) * Mx);");
 				FoamX->OutputType = CMOT_Float1;
 				FoamX->Description = TEXT("BF6 Jacobian foam");
 				FoamX->Inputs.Empty();
@@ -1385,7 +1385,17 @@ namespace
 
 		M->PreEditChange(nullptr);
 		M->PostEditChange();
-		UE_LOG(LogBF6HighPoly, Log, TEXT("water material: complete=%d"), M->IsComplete() ? 1 : 0);
+		// A material that fails to compile renders as the ENGINE DEFAULT, which
+		// is a flat grey - indistinguishable from "the water data is wrong"
+		// unless somebody reads the log. Say it loudly, at Warning, with the
+		// consequence spelled out.
+		if (!M->IsComplete())
+			UE_LOG(LogBF6HighPoly, Warning,
+				TEXT("WATER MATERIAL FAILED TO COMPILE - the surface will draw as flat grey ")
+				TEXT("(Unreal's default material). Look for 'Failed to compile Material' above ")
+				TEXT("for the HLSL error."));
+		else
+			UE_LOG(LogBF6HighPoly, Log, TEXT("water material: compiled"));
 		GWaterParent = M;
 		return M;
 	}
