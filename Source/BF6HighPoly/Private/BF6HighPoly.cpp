@@ -2300,7 +2300,87 @@ void FBF6HighPolyModule::StartupModule()
 		// moved or uninstalled while the editor is running, and the honest
 		// answer then is to ask again rather than to fail at read time.
 		const FString Install = EnsureInstall();
-		BF6Ext::ShowPopup(Install.IsEmpty() ? MakeSetupPanel() : MakeStatusPanel(Install), Center);
+		if (Install.IsEmpty())
+		{
+			BF6Ext::ShowPopup(MakeSetupPanel(), Center);
+			return;
+		}
+
+		// THE RING, not a panel: the same wheel the rest of the tool speaks,
+		// with each pill's state answering on its own sub line. Toggles hold
+		// the wheel open; BUILD and PANEL close it like any other pick.
+		TArray<BF6Ext::FPieSubEntry> R;
+
+		auto Mode = [&R](EMode M, const TCHAR* Label, const TCHAR* Means)
+		{
+			BF6Ext::FPieSubEntry E;
+			E.Label = Label;
+			E.Sub = [M, Means]{ return GMode == M ? FString(TEXT("current")) : FString(Means); };
+			E.OnPick = [M]{ GMode = M; ApplyMode(); };
+			R.Add(E);
+		};
+		Mode(EMode::LowPoly,  TEXT("LOW-POLY"), TEXT("just your map"));
+		Mode(EMode::Clay,     TEXT("CLAY"),     TEXT("study grey"));
+		Mode(EMode::Textured, TEXT("TEXTURED"), TEXT("the full thing"));
+
+		auto Layer = [&R](ELayer L)
+		{
+			const int32 i = (int32)L;
+			BF6Ext::FPieSubEntry E;
+			E.Label = GLayers[i].Name;
+			E.Sub = [i]{ return FString(GLayers[i].bOn ? TEXT("on") : TEXT("off")); };
+			E.OnPick = [i, L]{ GLayers[i].bOn = !GLayers[i].bOn; ApplyLayer(L); };
+			R.Add(E);
+		};
+		Layer(ELayer::Terrain);
+		Layer(ELayer::Roads);
+		Layer(ELayer::Objects);
+		Layer(ELayer::Water);
+
+		{
+			BF6Ext::FPieSubEntry E;
+			E.Label = TEXT("NANITE");
+			E.Sub = []{ return FString(GNanite ? TEXT("on - next build") : TEXT("off")); };
+			E.OnPick = []{ GNanite = !GNanite; };
+			R.Add(E);
+		}
+		{
+			BF6Ext::FPieSubEntry E;
+			E.Label = TEXT("WIND");
+			E.Sub = []{ return FString(GWind ? TEXT("swaying") : TEXT("still")); };
+			E.OnPick = []{ GWind = !GWind; ApplyWind(); };
+			R.Add(E);
+		}
+		{
+			BF6Ext::FPieSubEntry E;
+			E.Label = TEXT("LOW-POLY MAP");
+			E.Sub = []{ return FString(!GHideLowPoly ? TEXT("visible") : TEXT("hidden")); };
+			E.OnPick = []{ GHideLowPoly = !GHideLowPoly; ApplyMode(); };
+			R.Add(E);
+		}
+		{
+			BF6Ext::FPieSubEntry E;
+			E.Label = TEXT("BUILD");
+			E.Sub = []{ return FString(GLastCount > 0
+				? TEXT("rebuild from the game") : TEXT("read your install")); };
+			E.OnPick = []{ StartRead(); };
+			E.bCloses = true;
+			R.Add(E);
+		}
+		{
+			BF6Ext::FPieSubEntry E;
+			E.Label = TEXT("PANEL");
+			E.Sub = []{ return FString(TEXT("status and setup")); };
+			E.OnPick = [Center]
+			{
+				const FString Now = EnsureInstall();
+				BF6Ext::ShowPopup(Now.IsEmpty() ? MakeSetupPanel() : MakeStatusPanel(Now), Center);
+			};
+			E.bCloses = true;
+			R.Add(E);
+		}
+
+		BF6Ext::OpenPieSubRing(R, Center);
 	};
 	BF6Ext::RegisterPieEntry(Entry);
 
