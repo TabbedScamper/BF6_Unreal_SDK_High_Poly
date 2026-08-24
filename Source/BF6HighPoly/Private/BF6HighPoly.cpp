@@ -34,6 +34,7 @@
 #include "Materials/MaterialExpressionLinearInterpolate.h"
 #include "Materials/MaterialExpressionConstant3Vector.h"
 #include "Materials/MaterialExpressionCameraPositionWS.h"
+#include "Materials/MaterialExpressionTextureObjectParameter.h"
 #include "Materials/MaterialFunction.h"
 #include "UObject/UObjectIterator.h"
 #include "Brushes/SlateRoundedBoxBrush.h"
@@ -1236,6 +1237,28 @@ namespace
 		// How pronounced the fine ripples are. Ours, not the game's - the
 		// game gets this detail from its simulation's normal cascades.
 		UMaterialExpressionScalarParameter* Det = Scal(TEXT("DetailRipple"), 1.f, 1220);
+		UMaterialExpressionScalarParameter* ShD = Scal(TEXT("ShoreFadeDistance"), 6.f, 1280);
+		UMaterialExpressionScalarParameter* ShF = Scal(TEXT("ShoreFoam"), 0.55f, 1340);
+		UMaterialExpressionVectorParameter* DMin =
+			Cast<UMaterialExpressionVectorParameter>(
+				UMaterialEditingLibrary::CreateMaterialExpression(
+					M, UMaterialExpressionVectorParameter::StaticClass(), -900, 1400));
+		if (DMin) { DMin->ParameterName = TEXT("DepthMin"); DMin->DefaultValue = FLinearColor::Black; }
+		UMaterialExpressionVectorParameter* DSpan =
+			Cast<UMaterialExpressionVectorParameter>(
+				UMaterialEditingLibrary::CreateMaterialExpression(
+					M, UMaterialExpressionVectorParameter::StaticClass(), -900, 1460));
+		if (DSpan) { DSpan->ParameterName = TEXT("DepthSpan"); DSpan->DefaultValue = FLinearColor(1, 1, 1, 1); }
+		UMaterialExpressionTextureObjectParameter* DTex =
+			Cast<UMaterialExpressionTextureObjectParameter>(
+				UMaterialEditingLibrary::CreateMaterialExpression(
+					M, UMaterialExpressionTextureObjectParameter::StaticClass(), -900, 1520));
+		if (DTex)
+		{
+			DTex->ParameterName = TEXT("DepthTex");
+			DTex->SamplerType = SAMPLERTYPE_LinearColor;
+			DTex->Texture = LinearWhite();
+		}
 		UMaterialExpressionCameraPositionWS* CamP =
 			Cast<UMaterialExpressionCameraPositionWS>(
 				UMaterialEditingLibrary::CreateMaterialExpression(
@@ -1269,6 +1292,11 @@ namespace
 			In(TEXT("MinLen"), Bl2);
 			In(TEXT("Detail"), Det);
 			In(TEXT("CamPos"), CamP);
+			In(TEXT("ShoreD"), ShD);
+			In(TEXT("ShoreFoam"), ShF);
+			In(TEXT("DepthMin"), DMin);
+			In(TEXT("DepthSpan"), DSpan);
+			In(TEXT("DepthTex"), DTex);
 		};
 
 		UMaterialExpressionWorldPosition* WP =
@@ -1313,15 +1341,16 @@ namespace
 				UMaterialEditingLibrary::CreateMaterialExpression(
 					M, UMaterialExpressionCustom::StaticClass(), -300, 980));
 		if (WpoX && NrmX && WP && Tm && Gn && Ch && Bl && MnL && Det && CamP &&
+			ShD && ShF && DMin && DSpan && DTex &&
 			Wv[0] && Wv[1] && Wv[2] && Wv[3] && Wv[4] && Wv[5] && Wv[6] && Wv[7])
 		{
-			WpoX->Code = TEXT("// Each wave arrives as float3 (dir.x, dir.y, amplitude): a Custom\n// node takes a VectorParameter as float3, so asking for float4 here\n// is a compile error and a compile error is a GREY material.\nfloat3 w[8] = {W0,W1,W2,W3,W4,W5,W6,W7};\n// powers of 1/phi, so the sum does not repeat inside a level\nconst float ratio[8] = {1.0, 0.618, 0.382, 0.236, 0.146, 0.090, 0.056, 0.034};\nfloat2 pm = WPos.xy * 0.01;\nfloat3 disp = float3(0,0,0);\nfor (int i = 0; i < 8; i++) {\n  float len = max(ratio[i] * BaseLen, 0.5);\n  if (len < MinLen) continue;   // shorter than the grid can carry\n  float2 d = normalize(w[i].xy + float2(1e-5, 0));\n  float A = w[i].z * Gain;\n  float k = 6.2831853 / len;\n  float ph = k * dot(d, pm) - sqrt(9.81 * k) * T;\n  disp.xy += d * (Chop * A) * cos(ph);\n  disp.z  += A * sin(ph);\n}\nreturn disp * 100.0;");
+			WpoX->Code = TEXT("float3 w[8] = {W0,W1,W2,W3,W4,W5,W6,W7};\nconst float ratio[8] = {1.0, 0.618, 0.382, 0.236, 0.146, 0.090, 0.056, 0.034};\nfloat2 pm = WPos.xy * 0.01;\n// SHORE FADE, the way the game does it: the wave amplitude is scaled\n// down by how shallow the water is. Recovered form is\n//   depth = waterY - terrainY;  t = saturate(depth / D);\n//   fade  = saturate(cubic(t))\n// with the cubic authored per level - a plain smoothstep in the\n// default case. Without it the swell runs straight into the beach at\n// full height, which is what makes a repeating pattern so obvious near\n// land.\nfloat2 duv = (WPos.xy * 0.01 - DepthMin) / DepthSpan;\nfloat terrainY = Texture2DSample(DepthTex, DepthTexSampler, saturate(duv)).r;\nfloat depth = (WPos.z * 0.01) - terrainY;\nfloat st = saturate(depth / max(ShoreD, 0.5));\nfloat shore = st * st * (3.0 - 2.0 * st);   // smoothstep\nfloat3 disp = float3(0,0,0);\nfor (int i = 0; i < 8; i++) {\n  float len = max(ratio[i] * BaseLen, 0.5);\n  if (len < MinLen) continue;\n  float2 d = normalize(w[i].xy + float2(1e-5, 0));\n  float A = w[i].z * Gain * shore;\n  float k = 6.2831853 / len;\n  float ph = k * dot(d, pm) - sqrt(9.81 * k) * T;\n  disp.xy += d * (Chop * A) * cos(ph);\n  disp.z  += A * sin(ph);\n}\nreturn disp * 100.0;");
 			WpoX->OutputType = CMOT_Float3;
 			WpoX->Description = TEXT("BF6 Gerstner displacement");
 			WaveInputs(WpoX, WP, Tm, Wv, Gn, Ch, Bl, MnL);
 			UMaterialEditingLibrary::ConnectMaterialProperty(WpoX, TEXT(""), MP_WorldPositionOffset);
 
-			NrmX->Code = TEXT("float3 w[8] = {W0,W1,W2,W3,W4,W5,W6,W7};\nconst float ratio[8] = {1.0, 0.618, 0.382, 0.236, 0.146, 0.090, 0.056, 0.034};\nfloat2 pm = WPos.xy * 0.01;\n// distance in metres, for fading detail the far field cannot resolve\nfloat dist = length(WPos - CamPos) * 0.01;\nfloat3 n = float3(0,0,1);\nfor (int i = 0; i < 8; i++) {\n  float len = max(ratio[i] * BaseLen, 0.5);\n  float2 d = normalize(w[i].xy + float2(1e-5, 0));\n  float A = w[i].z * Gain;\n  float k = 6.2831853 / len;\n  float ph = k * dot(d, pm) - sqrt(9.81 * k) * T;\n  float wa = k * A;\n  n.xy -= d * wa * cos(ph);\n  n.z  -= Chop * wa * sin(ph);\n}\n// THE RIPPLES. Six octaves from about four metres down to fifteen\n// centimetres, each turned off as it stops being resolvable so the\n// surface settles smoothly into the distance instead of boiling.\nfloat2 dirA = normalize(w[0].xy + float2(1e-5, 0));\nfloat2 dirB = float2(-dirA.y, dirA.x);\nfloat rlen = 4.0;\nfloat ramp = Detail * 0.06;\nfor (int j = 0; j < 6; j++) {\n  float fade = saturate(1.0 - dist / (rlen * 90.0));\n  if (fade > 0.001) {\n    float k2 = 6.2831853 / rlen;\n    float sp = sqrt(9.81 * k2);\n    float2 dd = normalize(dirA * (1.0 + 0.7 * float(j % 3)) + dirB * (0.5 - 0.35 * float(j % 2)));\n    float p2 = k2 * dot(dd, pm) - sp * T * 1.15;\n    float amp = ramp * fade;\n    n.xy -= dd * (k2 * amp) * cos(p2);\n  }\n  rlen *= 0.55;\n  ramp *= 0.72;\n}\nreturn normalize(n);");
+			NrmX->Code = TEXT("float3 w[8] = {W0,W1,W2,W3,W4,W5,W6,W7};\nconst float ratio[8] = {1.0, 0.618, 0.382, 0.236, 0.146, 0.090, 0.056, 0.034};\nfloat2 pm = WPos.xy * 0.01;\n// SHORE FADE, the way the game does it: the wave amplitude is scaled\n// down by how shallow the water is. Recovered form is\n//   depth = waterY - terrainY;  t = saturate(depth / D);\n//   fade  = saturate(cubic(t))\n// with the cubic authored per level - a plain smoothstep in the\n// default case. Without it the swell runs straight into the beach at\n// full height, which is what makes a repeating pattern so obvious near\n// land.\nfloat2 duv = (WPos.xy * 0.01 - DepthMin) / DepthSpan;\nfloat terrainY = Texture2DSample(DepthTex, DepthTexSampler, saturate(duv)).r;\nfloat depth = (WPos.z * 0.01) - terrainY;\nfloat st = saturate(depth / max(ShoreD, 0.5));\nfloat shore = st * st * (3.0 - 2.0 * st);   // smoothstep\nfloat dist = length(WPos - CamPos) * 0.01;\nfloat3 n = float3(0,0,1);\nfor (int i = 0; i < 8; i++) {\n  float len = max(ratio[i] * BaseLen, 0.5);\n  float2 d = normalize(w[i].xy + float2(1e-5, 0));\n  float A = w[i].z * Gain * shore;\n  float k = 6.2831853 / len;\n  float ph = k * dot(d, pm) - sqrt(9.81 * k) * T;\n  float wa = k * A;\n  n.xy -= d * wa * cos(ph);\n  n.z  -= Chop * wa * sin(ph);\n}\n// Ripples, six octaves from about four metres down to fifteen\n// centimetres, each faded out as it stops being resolvable. These do\n// NOT take the shore fade: a beach still has ripples on it.\nfloat2 dirA = normalize(w[0].xy + float2(1e-5, 0));\nfloat2 dirB = float2(-dirA.y, dirA.x);\nfloat rlen = 4.0;\nfloat ramp = Detail * 0.06;\nfor (int j = 0; j < 6; j++) {\n  float fade = saturate(1.0 - dist / (rlen * 90.0));\n  if (fade > 0.001) {\n    float k2 = 6.2831853 / rlen;\n    float sp = sqrt(9.81 * k2);\n    float2 dd = normalize(dirA * (1.0 + 0.7 * float(j % 3)) + dirB * (0.5 - 0.35 * float(j % 2)));\n    float p2 = k2 * dot(dd, pm) - sp * T * 1.15;\n    n.xy -= dd * (k2 * ramp * fade) * cos(p2);\n  }\n  rlen *= 0.55;\n  ramp *= 0.72;\n}\nreturn normalize(n);");
 			NrmX->OutputType = CMOT_Float3;
 			NrmX->Description = TEXT("BF6 Gerstner normal");
 			WaveInputs(NrmX, WP, Tm, Wv, Gn, Ch, Bl, MnL);
@@ -1340,7 +1369,7 @@ namespace
 						M, UMaterialExpressionCustom::StaticClass(), -300, 1160));
 			if (FoamX)
 			{
-				FoamX->Code = TEXT("float3 w[8] = {W0,W1,W2,W3,W4,W5,W6,W7};\nconst float ratio[8] = {1.0, 0.618, 0.382, 0.236, 0.146, 0.090, 0.056, 0.034};\nfloat2 pm = WPos.xy * 0.01;\n// The divergence of the horizontal displacement - the same quantity\n// csWaterOceanDiff folds into foam. BF6 applies that displacement with\n// a MINUS sign, so foam belongs on POSITIVE divergence; the other way\n// round it collects in the troughs.\nfloat div = 0.0;\nfloat scale = 0.0;\nfor (int i = 0; i < 8; i++) {\n  float len = max(ratio[i] * BaseLen, 0.5);\n  if (len < MinLen) continue;\n  float2 d = normalize(w[i].xy + float2(1e-5, 0));\n  float A = w[i].z * Gain;\n  float k = 6.2831853 / len;\n  float ph = k * dot(d, pm) - sqrt(9.81 * k) * T;\n  float term = Chop * A * k;\n  div   += term * sin(ph);\n  scale += term;            // the most this sum could reach\n}\n// NORMALISED BY WHAT THIS SEA CAN ACTUALLY FOLD.\n// The authored FoamThreshold lives on the scale of the game's own FFT\n// Jacobian, which is not the scale of an eight-component analytic sum:\n// used raw it sits far above anything our divergence reaches and no\n// foam ever appears. Dividing by the maximum this wave set can produce\n// puts crest and trough at +1 and -1, so the threshold becomes a\n// fraction of the way up the crest and behaves the same on every map.\nfloat f = div / max(scale, 1e-4);\nfloat bias = clamp(Thr / 60.0, 0.02, 0.85);\nreturn saturate((f - bias) / max(1.0 - bias, 0.05)) * Mx;");
+				FoamX->Code = TEXT("float3 w[8] = {W0,W1,W2,W3,W4,W5,W6,W7};\nconst float ratio[8] = {1.0, 0.618, 0.382, 0.236, 0.146, 0.090, 0.056, 0.034};\nfloat2 pm = WPos.xy * 0.01;\n// SHORE FADE, the way the game does it: the wave amplitude is scaled\n// down by how shallow the water is. Recovered form is\n//   depth = waterY - terrainY;  t = saturate(depth / D);\n//   fade  = saturate(cubic(t))\n// with the cubic authored per level - a plain smoothstep in the\n// default case. Without it the swell runs straight into the beach at\n// full height, which is what makes a repeating pattern so obvious near\n// land.\nfloat2 duv = (WPos.xy * 0.01 - DepthMin) / DepthSpan;\nfloat terrainY = Texture2DSample(DepthTex, DepthTexSampler, saturate(duv)).r;\nfloat depth = (WPos.z * 0.01) - terrainY;\nfloat st = saturate(depth / max(ShoreD, 0.5));\nfloat shore = st * st * (3.0 - 2.0 * st);   // smoothstep\nfloat div = 0.0;\nfloat scale = 0.0;\nfor (int i = 0; i < 8; i++) {\n  float len = max(ratio[i] * BaseLen, 0.5);\n  if (len < MinLen) continue;\n  float2 d = normalize(w[i].xy + float2(1e-5, 0));\n  float A = w[i].z * Gain * shore;\n  float k = 6.2831853 / len;\n  float ph = k * dot(d, pm) - sqrt(9.81 * k) * T;\n  float term = Chop * A * k;\n  div   += term * sin(ph);\n  scale += term;\n}\nfloat f = div / max(scale, 1e-4);\nfloat bias = clamp(Thr / 60.0, 0.02, 0.85);\nfloat crest = saturate((f - bias) / max(1.0 - bias, 0.05)) * Mx;\n// AND FOAM WHERE IT MEETS LAND. The game exports 1 - fade to the pixel\n// shader for exactly this: surf collects where the water is shallow.\nfloat surf = saturate(1.0 - shore) * ShoreFoam;\nreturn saturate(max(crest, surf));");
 				FoamX->OutputType = CMOT_Float1;
 				FoamX->Description = TEXT("BF6 Jacobian foam");
 				FoamX->Inputs.Empty();
@@ -1360,6 +1389,11 @@ namespace
 				In(TEXT("MinLen"), MnL);
 				In(TEXT("Detail"), Det);
 				In(TEXT("CamPos"), CamP);
+				In(TEXT("ShoreD"), ShD);
+				In(TEXT("ShoreFoam"), ShF);
+				In(TEXT("DepthMin"), DMin);
+				In(TEXT("DepthSpan"), DSpan);
+				In(TEXT("DepthTex"), DTex);
 				In(TEXT("Thr"), FTh);
 				In(TEXT("Mx"), FMx);
 
@@ -1439,6 +1473,11 @@ namespace
 		// metres between grid vertices, so the shader can drop wave
 		// components the geometry cannot represent
 		float VertexSpacingM = 8.f;
+		// Depth over which the swell dies as it reaches shallow water. The
+		// game authors this per level (the ShoreFadeDistance the visual
+		// environment can override); we have no reader for the value yet, so
+		// this is calibration.
+		float ShoreFadeM = 6.f;
 		bool  bValid = false;
 	};
 
@@ -1468,6 +1507,21 @@ namespace
 		if (Picked.Num() == 0) return R;
 
 		const float Top = FMath::Max(Picked[0].Y, 1e-4f);
+		// KEEP THE DISPLACING COMPONENTS INSIDE ONE HALF-PLANE.
+		//
+		// The distribution is often a MIRRORED pair - two lobes half a turn
+		// apart - because the authored spectrum is symmetric about the wind
+		// axis. Two opposed trains of the same wavelength are a STANDING
+		// wave: it does not travel, and it draws a regular grid. The Godot
+		// reference fans each lobe to soften that, which works while eight
+		// components are displacing; once the grid can only carry two or
+		// three, a fan of two opposed rays is a lattice again, which is
+		// exactly the repeating pattern this produced.
+		//
+		// So every direction is folded into the half-plane around the
+		// dominant lobe. The spread survives, the opposition does not.
+		const float LeadAng = S.WindAngle + (Picked[0].X - 0.5f) * 2.f * PI;
+		const FVector2D Lead(FMath::Cos(LeadAng), FMath::Sin(LeadAng));
 		int32 n = 0;
 		// Ratio is a function-scope STATIC, so it has static storage duration
 		// and must not be named in the capture list - it is reachable without
@@ -1476,8 +1530,10 @@ namespace
 		{
 			const float Off = FMath::DegreesToRadians(
 				46.f * (FMath::Fmod((float)n * 0.61803399f, 1.f) - 0.5f));
-			R.W[n] = FLinearColor(FMath::Cos(BaseAng + Off), FMath::Sin(BaseAng + Off),
-			                      Amp, Ratio[n]);
+			float cx = FMath::Cos(BaseAng + Off), cy = FMath::Sin(BaseAng + Off);
+			// fold into the leader's half-plane
+			if (cx * Lead.X + cy * Lead.Y < 0.f) { cx = -cx; cy = -cy; }
+			R.W[n] = FLinearColor(cx, cy, Amp, Ratio[n]);
 			n++;
 		};
 		const int32 Per = FMath::Max(1, 8 / Picked.Num());
@@ -1548,6 +1604,14 @@ namespace
 		UMaterialInstanceDynamic* MID = UMaterialInstanceDynamic::Create(Parent, Outer);
 		if (!MID) return nullptr;
 		MID->SetFlags(RF_Transient);
+		if (GWaterDepthTex)
+		{
+			MID->SetTextureParameterValue(TEXT("DepthTex"), GWaterDepthTex);
+			MID->SetVectorParameterValue(TEXT("DepthMin"),
+				FLinearColor((float)GWaterDepthMin.X, (float)GWaterDepthMin.Y, 0.f, 0.f));
+			MID->SetVectorParameterValue(TEXT("DepthSpan"),
+				FLinearColor((float)GWaterDepthSpan.X, (float)GWaterDepthSpan.Y, 1.f, 1.f));
+		}
 		if (Waves && Waves->bValid)
 		{
 			for (int32 i = 0; i < 8; i++)
@@ -1558,6 +1622,7 @@ namespace
 			MID->SetScalarParameterValue(TEXT("FoamThreshold"), Waves->FoamThreshold);
 			MID->SetScalarParameterValue(TEXT("FoamMax"), Waves->FoamMax);
 			MID->SetScalarParameterValue(TEXT("MinDispLen"), Waves->VertexSpacingM * 3.f);
+			MID->SetScalarParameterValue(TEXT("ShoreFadeDistance"), Waves->ShoreFadeM);
 		}
 		// THE GAME'S OWN COLOUR CONVERSION.
 		//
@@ -1621,12 +1686,63 @@ namespace
 		return MID;
 	}
 
+	// The terrain's heights as a texture, so the water surface can ask how
+	// deep it is at any point. The game does the same thing through a
+	// virtual-texture heightfield fetch.
+	UTexture2D* GWaterDepthTex = nullptr;
+	FVector2D   GWaterDepthMin = FVector2D::ZeroVector;   // world XZ of texel 0
+	FVector2D   GWaterDepthSpan = FVector2D(1, 1);
+
+	UTexture2D* MakeDepthTexture(const BF6HP::FCore::FTerrain& T)
+	{
+		if (T.Size <= 1 || T.Heights.Num() < T.Size * T.Size) return nullptr;
+		// A quarter of the native side is plenty: this drives an amplitude
+		// fade, not geometry.
+		const int32 N = FMath::Clamp(T.Size / 4, 64, 1024);
+		UTexture2D* Tex = UTexture2D::CreateTransient(N, N, PF_R32_FLOAT);
+		if (!Tex) return nullptr;
+		Tex->SRGB = false;
+		Tex->CompressionSettings = TC_HDR;
+		Tex->AddressX = TA_Clamp;
+		Tex->AddressY = TA_Clamp;
+		Tex->Filter = TF_Bilinear;
+		const double YScale = T.HeightScale > 0.f
+			? (double)T.HeightScale / 65536.0
+			: FMath::Max(0.001, T.WorldMax.Y - T.WorldMin.Y) / 65535.0;
+		if (float* P = (float*)Tex->GetPlatformData()->Mips[0].BulkData.Lock(LOCK_READ_WRITE))
+		{
+			for (int32 y = 0; y < N; y++)
+				for (int32 x = 0; x < N; x++)
+				{
+					const int32 sx = FMath::Min(T.Size - 1, x * T.Size / N);
+					const int32 sy = FMath::Min(T.Size - 1, y * T.Size / N);
+					P[y * N + x] = (float)(T.Heights[sy * T.Size + sx] * YScale + T.WorldMin.Y);
+				}
+			Tex->GetPlatformData()->Mips[0].BulkData.Unlock();
+		}
+		Tex->UpdateResource();
+		Tex->AddToRoot();
+		GWaterDepthMin = FVector2D(T.WorldMin.X, T.WorldMin.Z);
+		GWaterDepthSpan = FVector2D(
+			FMath::Max(1.0, T.WorldMax.X - T.WorldMin.X),
+			FMath::Max(1.0, T.WorldMax.Z - T.WorldMin.Z));
+		return Tex;
+	}
+
 	int32 GWaterBuilt = 0;
 
 	int32 BuildWater(AActor* A, USceneComponent* Root,
-	                 const TArray<BF6HP::FCore::FWater>& W, TArray<UStaticMesh*>& OutPending)
+	                 const TArray<BF6HP::FCore::FWater>& W, TArray<UStaticMesh*>& OutPending,
+	                 const BF6HP::FCore::FTerrain* Ground)
 	{
 		GWaterBuilt = 0;
+		// The water needs to know how deep it is to fade its swell into the
+		// shore. Without the ground it simply does not fade, which is the
+		// behaviour before this existed rather than a broken one.
+		GWaterDepthTex = Ground ? MakeDepthTexture(*Ground) : nullptr;
+		if (!GWaterDepthTex)
+			UE_LOG(LogBF6HighPoly, Log,
+				TEXT("water: no heightfield, so no shore fade (turn Terrain on to get it)"));
 		// One sim per level; every surface shares the sea state. bOcean below
 		// tunes only the base wavelength.
 		BF6HP::FCore::FWaterSim Sim;
@@ -2059,7 +2175,7 @@ namespace
 			TArray<BF6HP::FCore::FWater> Water;
 			if (GCore.ReadWater(BF6Ext::CurrentLevel(), Water))
 			{
-				BuildWater(A, Root, Water, Pending);
+				BuildWater(A, Root, Water, Pending, bHaveGround ? &Ground : nullptr);
 				UE_LOG(LogBF6HighPoly, Log, TEXT("water: %d surface(s)"), GWaterBuilt);
 			}
 			else
