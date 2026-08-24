@@ -2184,7 +2184,20 @@ namespace
 			TArray<BF6HP::FCore::FWater> Water;
 			if (GCore.ReadWater(BF6Ext::CurrentLevel(), Water))
 			{
-				BuildWater(A, Root, Water, Pending, bHaveGround ? &Ground : nullptr);
+				// THE SHORE FADE ONLY NEEDS THE HEIGHTS, NOT THE MESH.
+				//
+				// Reading the heightfield is a decode; BUILDING terrain is
+				// the expensive part. Tying the fade to the Terrain LAYER
+				// meant a creator who wanted water alone got a sea that ran
+				// into the beach at full height, which is not a choice
+				// anybody would make on purpose. So if the ground was not
+				// read for its own sake, read it here just for the depths.
+				BF6HP::FCore::FTerrain WaterGround;
+				const BF6HP::FCore::FTerrain* Depths = nullptr;
+				if (bHaveGround) Depths = &Ground;
+				else if (GCore.ReadTerrain(BF6Ext::CurrentLevel(), WaterGround))
+					Depths = &WaterGround;
+				BuildWater(A, Root, Water, Pending, Depths);
 				UE_LOG(LogBF6HighPoly, Log, TEXT("water: %d surface(s)"), GWaterBuilt);
 			}
 			else
