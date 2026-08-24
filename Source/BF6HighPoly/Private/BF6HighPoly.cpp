@@ -1534,15 +1534,39 @@ namespace
 
 		BF6Ext::ClearAddonActors(kAddonName);
 
-		// Group the placements by asset, busiest first, then spend the budget.
-		TMap<FString, TArray<const BF6HP::FPlacement*>> ByMesh;
+		// Group the placements by asset - AND by variation, where the
+		// variation earns it. A livery or a paint is a variant depot record,
+		// and two placements of one vehicle with different liveries cannot
+		// share a material. But the split is paid for in components and mesh
+		// builds, so it happens only where the core says the variation
+		// actually derives a live record for this mesh; everything else
+		// stays grouped exactly as before.
+		struct FGroup
+		{
+			FString Mesh, Bundle, Variation;
+			TArray<const BF6HP::FPlacement*> Rows;
+		};
+		TMap<FString, FGroup> ByMesh;
 		for (const BF6HP::FPlacement& p : P)
-			if (!p.Mesh.IsEmpty()) ByMesh.FindOrAdd(p.Mesh).Add(&p);
+		{
+			if (p.Mesh.IsEmpty()) continue;
+			FString Key = p.Mesh;
+			FString Var;
+			if (!p.Variation.IsEmpty() &&
+			    GCore.VariationLive(BF6HP::FCore::MeshResourceFor(p.Mesh), p.Bundle, p.Variation))
+			{
+				Var = p.Variation;
+				Key += TEXT("|") + p.Variation + TEXT("|") + p.Bundle;
+			}
+			FGroup& G = ByMesh.FindOrAdd(Key);
+			if (G.Rows.Num() == 0) { G.Mesh = p.Mesh; G.Bundle = p.Bundle; G.Variation = Var; }
+			G.Rows.Add(&p);
+		}
 
 		TArray<FString> Order;
 		ByMesh.GetKeys(Order);
 		Order.Sort([&ByMesh](const FString& a, const FString& b)
-			{ return ByMesh[a].Num() > ByMesh[b].Num(); });
+			{ return ByMesh[a].Rows.Num() > ByMesh[b].Rows.Num(); });
 		// The pills only turn on what is needed, and OFF means not built, not
 		// merely hidden: a layer nobody asked for costs nothing.
 		if (!GLayers[(int32)ELayer::Objects].bOn) Order.Empty();
@@ -1674,15 +1698,14 @@ namespace
 			for (int32 i = First; i < Last; i++)
 			{
 				TArray<BF6HP::FCore::FSection> Sections;
-				// The bundle that PLACED this mesh, so its material resolves in
-				// the right scope. Placements of one mesh from several bundles
-				// are grouped together here, so this takes the first: exact
-				// per-instance scoping means grouping by (mesh, bundle), which
-				// is a real next step rather than a silent approximation. It
-				// holds today only because duplicate keys are byte-identical.
-				const TArray<const BF6HP::FPlacement*>& Group = ByMesh[Order[i]];
-				const FString Bundle = Group.Num() ? Group[0]->Bundle : FString();
-				if (!GCore.ReadMesh(BF6HP::FCore::MeshResourceFor(Order[i]), Sections, Bundle))
+				// The group's own scope: its placing bundle AND its variation.
+				// The variation is what makes a livery a livery - the variant
+				// record carries the delta and the core merges it over the
+				// base. Ungated groups carry an empty variation and read
+				// exactly as before.
+				const FGroup& G = ByMesh[Order[i]];
+				if (!GCore.ReadMesh(BF6HP::FCore::MeshResourceFor(G.Mesh), Sections,
+				                    G.Bundle, G.Variation))
 				{
 					OutFailed++;
 					continue;
@@ -1723,7 +1746,7 @@ namespace
 				H->SetCollisionEnabled(ECollisionEnabled::NoCollision);
 
 				TArray<FTransform> Xf;
-				for (const BF6HP::FPlacement* p : ByMesh[Names[i]])
+				for (const BF6HP::FPlacement* p : ByMesh[Names[i]].Rows)
 				{
 					// The basis carries scale as well as rotation, so it goes
 					// across as a matrix. Y and Z swap to match the vertices;

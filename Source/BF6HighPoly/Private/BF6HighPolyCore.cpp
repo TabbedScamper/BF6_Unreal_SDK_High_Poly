@@ -24,6 +24,7 @@ namespace
 	typedef bf6_mesh* (*FnReadMeshScoped)(bf6_ctx*, const char*, int, const char*, const char*);
 	typedef const bf6_texture* (*FnTextureAt)(bf6_ctx*, int);
 	typedef int (*FnWater)(bf6_ctx*, const char*, bf6_water*, int);
+	typedef int (*FnVarLive)(bf6_ctx*, const char*, const char*, const char*);
 	typedef int (*FnDecals)(bf6_ctx*, const char*, bf6_decal*, int);
 
 	FnOpen      GOpen      = nullptr;
@@ -38,6 +39,7 @@ namespace
 	FnReadMeshScoped GReadScoped = nullptr;
 	FnTextureAt GTextureAt = nullptr;
 	FnWater     GWater     = nullptr;
+	FnVarLive   GVarLive   = nullptr;
 
 	// The C callback the core drives. Stores and returns; no UI, no allocation
 	// beyond the string, because this runs on the core's worker threads.
@@ -80,6 +82,7 @@ bool FCore::Open(const FString& GameDir, const FString& DllPath)
 	GReadScoped  = (FnReadMeshScoped) FPlatformProcess::GetDllExport(Dll, TEXT("bf6_read_mesh_scoped"));
 	GTextureAt   = (FnTextureAt) FPlatformProcess::GetDllExport(Dll, TEXT("bf6_texture_at"));
 	GWater       = (FnWater)     FPlatformProcess::GetDllExport(Dll, TEXT("bf6_level_water"));
+	GVarLive     = (FnVarLive)   FPlatformProcess::GetDllExport(Dll, TEXT("bf6_variation_live"));
 	if (!GOpen || !GOpenLevel || !GInstances)
 	{
 		// The tool ships a core too, and an older one has no bf6_open_level.
@@ -271,6 +274,17 @@ bool FCore::ReadDecals(const FString& Level, TArray<FDecal>& Out)
 	return Out.Num() > 0;
 }
 
+
+bool FCore::VariationLive(const FString& ResName, const FString& Bundle,
+                          const FString& Variation)
+{
+	// An older core cannot answer, and the safe answer is NO SPLIT: the base
+	// look for everything, which is what the add-on always did.
+	if (!Ctx || !GVarLive || Variation.IsEmpty()) return false;
+	return GVarLive(Ctx, TCHAR_TO_UTF8(*ResName),
+	                Bundle.IsEmpty() ? nullptr : TCHAR_TO_UTF8(*Bundle),
+	                TCHAR_TO_UTF8(*Variation)) != 0;
+}
 
 bool FCore::ReadWater(const FString& Level, TArray<FWater>& Out)
 {

@@ -111,6 +111,13 @@ namespace BF6HP
 		// material that merely collides, which looks right and is not. Empty is
 		// allowed and falls back to the bundle the resource lives in, which is
 		// the only option for a mesh nothing has placed.
+		// Does this variation derive a live record for this mesh? The gate
+		// that makes splitting instance groups by variation EARNED rather
+		// than automatic - the reference plugin measured the difference at
+		// four milliseconds of frame on one map.
+		bool VariationLive(const FString& ResName, const FString& Bundle,
+		                   const FString& Variation);
+
 		bool ReadMesh(const FString& ResName, TArray<FSection>& Out,
 		              const FString& PlacingBundle = FString(),
 		              const FString& Variation = FString());
