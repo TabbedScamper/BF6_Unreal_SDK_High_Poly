@@ -1479,6 +1479,11 @@ namespace
 	// colour is missing, spread over a fade depth. The ocean variant authors
 	// one colour and no deep - the reference consumer darkens for depth, and
 	// the same rule holds here.
+	// Metres over which the authored colour is reached. The game carries this
+	// per material (CB1[0].w); we have no reader for it yet, so it is one
+	// number here rather than a guess dressed as data.
+	float AbsorptionDistanceM = 10.f;
+
 	UMaterialInstanceDynamic* WaterMaterialFor(UObject* Outer, const BF6HP::FCore::FWater& W,
 	                                           const FWaveSet* Waves)
 	{
@@ -1535,11 +1540,6 @@ namespace
 			FMath::Max(C.B, 0.002f) * 0.35f));
 		return MID;
 	}
-
-	// Metres over which the authored colour is reached. The game carries this
-	// per material (CB1[0].w); we have no reader for it yet, so it is one
-	// number here rather than a guess dressed as data.
-	float AbsorptionDistanceM = 10.f;
 
 	int32 GWaterBuilt = 0;
 
