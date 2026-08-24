@@ -1198,10 +1198,16 @@ namespace
 		if (SLW && Absorb)
 			UMaterialEditingLibrary::ConnectMaterialExpressions(Absorb, TEXT(""), SLW, TEXT("AbsorptionCoefficients"));
 
-		// The SURFACE itself: near-black base so the body colour comes from
-		// the water volume, low roughness so the sky reflects.
+		// THE SURFACE ALBEDO, which is what the game itself writes.
+		//
+		// Its water pixel shader converts the authored colour with
+		// saturate(1 + ln(c)/d) and puts THAT in the G-buffer as the base
+		// colour. This was previously a near-black constant, on the theory
+		// that all the colour should come out of the volume - and near-black
+		// base colour plus a volume is how you render black water. The
+		// instance overwrites this with the level's own converted colour.
 		UMaterialExpressionVectorParameter* Tint =
-			Vec(TEXT("SurfaceTint"), FLinearColor(0.008f, 0.011f, 0.012f), 60);
+			Vec(TEXT("SurfaceTint"), FLinearColor(0.10f, 0.45f, 0.55f), 60);
 		if (Tint) UMaterialEditingLibrary::ConnectMaterialProperty(Tint, TEXT(""), MP_BaseColor);
 		UMaterialExpressionScalarParameter* Rough =
 			Cast<UMaterialExpressionScalarParameter>(
@@ -1437,20 +1443,14 @@ namespace
 		// is a flat grey - indistinguishable from "the water data is wrong"
 		// unless somebody reads the log. Say it loudly, at Warning, with the
 		// consequence spelled out.
-		// UE_LOG expands to several statements, so it needs braces here: a
-		// braceless if/else around it does not compile.
-		if (!M->IsComplete() && !M->IsCompiling())
-		{
-			UE_LOG(LogBF6HighPoly, Warning,
-				TEXT("WATER MATERIAL FAILED TO COMPILE - the surface will draw as flat grey ")
-				TEXT("(Unreal's default material). Search the log for 'Failed to compile Material' ")
-				TEXT("to find the HLSL error and the line it is on."));
-		}
-		else
-		{
-			UE_LOG(LogBF6HighPoly, Log, TEXT("water material: %s"),
-				M->IsCompiling() ? TEXT("compiling") : TEXT("compiled"));
-		}
+		// SHADERS COMPILE ASYNCHRONOUSLY, so asking IsComplete the instant
+		// after PostEditChange always says no and always warned - which
+		// trains everyone to ignore the warning that matters. The engine
+		// raises its own 'Failed to compile Material' with the HLSL error
+		// attached; this just points at it.
+		UE_LOG(LogBF6HighPoly, Log,
+			TEXT("water material built (shaders compile async - if the surface draws flat ")
+			TEXT("grey, search the log for 'Failed to compile Material')"));
 		GWaterParent = M;
 		return M;
 	}
@@ -1712,6 +1712,15 @@ namespace
 		// Square root, because the authored brightness spans two orders of
 		// magnitude and a linear mapping makes every dark water pitch black.
 		const float Bright = FMath::Sqrt(FMath::Clamp(Peak, 0.f, 1.f));
+
+		// The surface albedo the deferred pass would receive in the game.
+		// Hue keeps the map's character; the brightness floor stops a dark
+		// authored colour from rendering as a black mirror, which is what
+		// happened when this was left at its near-black default.
+		MID->SetVectorParameterValue(TEXT("SurfaceTint"), FLinearColor(
+			Hue.R * FMath::Max(Bright, 0.35f),
+			Hue.G * FMath::Max(Bright, 0.35f),
+			Hue.B * FMath::Max(Bright, 0.35f)));
 
 		// SCATTERING is what comes back out: the water's own colour, at a
 		// strength set by how bright the map authored it.
