@@ -994,10 +994,198 @@ namespace
 	// and landing on the same position bit for bit.
 	int32 GTerrainTile = 128;          // quads per tile side
 
+	// Ground bake resolution. 2048 over a 4 km map is about two metres a
+	// texel, which reads correctly from the air and softens underfoot; the
+	// cost is 16 MB of RGBA per sheet.
+	int32 GGroundBakeSize = 2048;
+
+	// ---- the ground, from the game's own layer materials -----------------
+	//
+	// The terrain mesh used to draw with no material at all, which is the
+	// flat grey. The bake gives a top-down albedo and normal for a world
+	// window, so the material samples them by WORLD POSITION rather than by
+	// any UV the mesh carries - the ground is a grid built from a
+	// heightfield and its UVs are an implementation detail, while the bake's
+	// world rectangle is exact.
+	UMaterial* GGroundParent = nullptr;
+	UTexture2D* GGroundAlbedo = nullptr;
+	UTexture2D* GGroundNormal = nullptr;
+
+	UMaterial* EnsureGroundMaterial()
+	{
+		if (GGroundParent) return GGroundParent;
+		UPackage* Pkg = CreatePackage(TEXT("/Temp/BF6HighPoly_Ground"));
+		if (!Pkg) return nullptr;
+		Pkg->SetFlags(RF_Transient);
+		UMaterial* M = NewObject<UMaterial>(Pkg, TEXT("M_BF6HighPoly_Ground"), RF_Transient);
+		M->MaterialDomain = MD_Surface;
+		M->SetShadingModel(MSM_DefaultLit);
+		M->BlendMode = BLEND_Opaque;
+		M->TwoSided = false;
+
+		UMaterialExpressionTextureSampleParameter2D* Alb =
+			Cast<UMaterialExpressionTextureSampleParameter2D>(
+				UMaterialEditingLibrary::CreateMaterialExpression(
+					M, UMaterialExpressionTextureSampleParameter2D::StaticClass(), -400, 0));
+		UMaterialExpressionTextureSampleParameter2D* Nrm =
+			Cast<UMaterialExpressionTextureSampleParameter2D>(
+				UMaterialEditingLibrary::CreateMaterialExpression(
+					M, UMaterialExpressionTextureSampleParameter2D::StaticClass(), -400, 300));
+		if (Alb)
+		{
+			Alb->ParameterName = TEXT("GroundAlbedo");
+			Alb->SamplerType = SAMPLERTYPE_Color;
+			Alb->Texture = LoadObject<UTexture2D>(nullptr,
+				TEXT("/Engine/EngineResources/WhiteSquareTexture.WhiteSquareTexture"));
+		}
+		if (Nrm)
+		{
+			Nrm->ParameterName = TEXT("GroundNormal");
+			Nrm->SamplerType = SAMPLERTYPE_LinearColor;   // it is not a compressed normal
+			Nrm->Texture = LinearWhite();
+		}
+
+		// WORLD-POSITION UVs. uv = (worldXY_metres - Lo) / Span, with the
+		// rectangle handed in as parameters so one material serves every map
+		// and every window.
+		UMaterialExpressionWorldPosition* WP =
+			Cast<UMaterialExpressionWorldPosition>(
+				UMaterialEditingLibrary::CreateMaterialExpression(
+					M, UMaterialExpressionWorldPosition::StaticClass(), -900, 120));
+		UMaterialExpressionVectorParameter* Lo =
+			Cast<UMaterialExpressionVectorParameter>(
+				UMaterialEditingLibrary::CreateMaterialExpression(
+					M, UMaterialExpressionVectorParameter::StaticClass(), -900, 200));
+		UMaterialExpressionVectorParameter* Span =
+			Cast<UMaterialExpressionVectorParameter>(
+				UMaterialEditingLibrary::CreateMaterialExpression(
+					M, UMaterialExpressionVectorParameter::StaticClass(), -900, 260));
+		if (Lo) { Lo->ParameterName = TEXT("GroundLo"); Lo->DefaultValue = FLinearColor::Black; }
+		if (Span) { Span->ParameterName = TEXT("GroundSpan"); Span->DefaultValue = FLinearColor(1,1,1,1); }
+
+		UMaterialExpressionCustom* UV =
+			Cast<UMaterialExpressionCustom>(
+				UMaterialEditingLibrary::CreateMaterialExpression(
+					M, UMaterialExpressionCustom::StaticClass(), -650, 150));
+		if (UV && WP && Lo && Span)
+		{
+			UV->Code = TEXT("return (WPos.xy * 0.01 - Lo.xy) / max(Span.xy, 1.0);");
+			UV->OutputType = CMOT_Float2;
+			UV->Description = TEXT("BF6 ground world UV");
+			UV->Inputs.Empty();
+			auto In = [&UV](const TCHAR* Nm, UMaterialExpression* E)
+			{ FCustomInput I; I.InputName = Nm; I.Input.Expression = E; UV->Inputs.Add(I); };
+			In(TEXT("WPos"), WP);
+			In(TEXT("Lo"), Lo);
+			In(TEXT("Span"), Span);
+			if (Alb) UMaterialEditingLibrary::ConnectMaterialExpressions(UV, TEXT(""), Alb, TEXT("UVs"));
+			if (Nrm) UMaterialEditingLibrary::ConnectMaterialExpressions(UV, TEXT(""), Nrm, TEXT("UVs"));
+		}
+		if (Alb) UMaterialEditingLibrary::ConnectMaterialProperty(Alb, TEXT(""), MP_BaseColor);
+		// The bake's normal is 0.5n+0.5 in TANGENT space, stored uncompressed,
+		// so it is unpacked here rather than sampled as a normal map.
+		if (Nrm)
+		{
+			UMaterialExpressionConstantBiasScale* BS =
+				Cast<UMaterialExpressionConstantBiasScale>(
+					UMaterialEditingLibrary::CreateMaterialExpression(
+						M, UMaterialExpressionConstantBiasScale::StaticClass(), -150, 300));
+			if (BS)
+			{
+				BS->Bias = -0.5f; BS->Scale = 2.f;
+				UMaterialEditingLibrary::ConnectMaterialExpressions(Nrm, TEXT(""), BS, TEXT(""));
+				UMaterialEditingLibrary::ConnectMaterialProperty(BS, TEXT(""), MP_Normal);
+			}
+		}
+		UMaterialExpressionScalarParameter* Rg =
+			Cast<UMaterialExpressionScalarParameter>(
+				UMaterialEditingLibrary::CreateMaterialExpression(
+					M, UMaterialExpressionScalarParameter::StaticClass(), -400, 500));
+		if (Rg)
+		{
+			Rg->ParameterName = TEXT("GroundRoughness");
+			Rg->DefaultValue = 0.9f;   // ground is not shiny
+			UMaterialEditingLibrary::ConnectMaterialProperty(Rg, TEXT(""), MP_Roughness);
+		}
+
+		M->PreEditChange(nullptr);
+		M->PostEditChange();
+		GGroundParent = M;
+		return M;
+	}
+
+	// One RGBA8 texture from a bake buffer.
+	UTexture2D* MakeBakeTexture(const uint8* Pixels, int32 N, bool bSrgb)
+	{
+		if (!Pixels || N <= 0) return nullptr;
+		UTexture2D* Tex = UTexture2D::CreateTransient(N, N, PF_B8G8R8A8);
+		if (!Tex) return nullptr;
+		Tex->SRGB = bSrgb;
+		Tex->CompressionSettings = bSrgb ? TC_Default : TC_VectorDisplacementmap;
+		Tex->AddressX = TA_Clamp;
+		Tex->AddressY = TA_Clamp;
+		Tex->Filter = TF_Trilinear;
+		if (uint8* P = (uint8*)Tex->GetPlatformData()->Mips[0].BulkData.Lock(LOCK_READ_WRITE))
+		{
+			// the bake is RGBA, the platform format is BGRA
+			for (int32 i = 0; i < N * N; i++)
+			{
+				P[i * 4 + 0] = Pixels[i * 4 + 2];
+				P[i * 4 + 1] = Pixels[i * 4 + 1];
+				P[i * 4 + 2] = Pixels[i * 4 + 0];
+				P[i * 4 + 3] = Pixels[i * 4 + 3];
+			}
+			Tex->GetPlatformData()->Mips[0].BulkData.Unlock();
+		}
+		Tex->UpdateResource();
+		Tex->AddToRoot();
+		return Tex;
+	}
+
+	// Bake the ground and hand back a material instance for the terrain tiles.
+	// Null when there is nothing to bake, which leaves the terrain as it was.
+	UMaterialInstanceDynamic* MakeGroundMaterial(UObject* Outer, const FString& Level)
+	{
+		BF6HP::FCore::FGroundBake B;
+		const double T0 = FPlatformTime::Seconds();
+		if (!GCore.BakeGround(Level, FVector2D::ZeroVector, 0.f, GGroundBakeSize, B))
+		{
+			UE_LOG(LogBF6HighPoly, Warning, TEXT("ground bake: %s"), *GCore.Error);
+			return nullptr;
+		}
+		UE_LOG(LogBF6HighPoly, Log,
+			TEXT("ground bake: %d px over %.0f m (%.2f m/texel), %d layer(s), %d textured, ")
+			TEXT("%.1f%% untextured, %.1fs"),
+			B.Size, B.Hi.X - B.Lo.X, B.MetresPerTexel, B.LayersUsed, B.LayersTextured,
+			B.FallbackFraction * 100.f, FPlatformTime::Seconds() - T0);
+
+		GGroundAlbedo = MakeBakeTexture(B.Albedo, B.Size, /*sRGB*/ true);
+		GGroundNormal = MakeBakeTexture(B.Normal, B.Size, /*sRGB*/ false);
+		UMaterial* Parent = EnsureGroundMaterial();
+		if (!Parent || !GGroundAlbedo) return nullptr;
+		UMaterialInstanceDynamic* MID = UMaterialInstanceDynamic::Create(Parent, Outer);
+		if (!MID) return nullptr;
+		MID->SetFlags(RF_Transient);
+		MID->SetTextureParameterValue(TEXT("GroundAlbedo"), GGroundAlbedo);
+		if (GGroundNormal) MID->SetTextureParameterValue(TEXT("GroundNormal"), GGroundNormal);
+		MID->SetVectorParameterValue(TEXT("GroundLo"),
+			FLinearColor((float)B.Lo.X, (float)B.Lo.Y, 0, 0));
+		MID->SetVectorParameterValue(TEXT("GroundSpan"),
+			FLinearColor(FMath::Max(1.f, (float)(B.Hi.X - B.Lo.X)),
+			             FMath::Max(1.f, (float)(B.Hi.Y - B.Lo.Y)), 1, 1));
+		return MID;
+	}
+
+	// Held across a build so every tile shares one instance.
+	UMaterialInstanceDynamic* GroundMat = nullptr;
+
 	int32 BuildTerrain(AActor* A, USceneComponent* Root, const BF6HP::FCore::FTerrain& T,
 	                   TArray<UStaticMesh*>& OutPending)
 	{
 		if (T.Size <= 1) return 0;
+
+		// Bake the ground once for the whole map, before any tile is made.
+		GroundMat = MakeGroundMaterial(A, BF6Ext::CurrentLevel());
 
 		const int32 N = FMath::Min(GTerrainSide, T.Size);
 		const int32 Step = FMath::Max(1, (T.Size - 1) / (N - 1));
@@ -1090,7 +1278,14 @@ namespace
 
 			UStaticMesh* SM = NewObject<UStaticMesh>(
 				A, *FString::Printf(TEXT("Terrain_%d_%d"), tx, tz), RF_Transient);
-			SM->GetStaticMaterials().Add(FStaticMaterial());
+			// THE GROUND'S REAL MATERIALS. Baked once for the whole map and
+			// shared by every tile: the material addresses the bake by WORLD
+			// POSITION, so one instance serves the lot and no tile needs UVs
+			// of its own. Null leaves the tile unmaterialled, which is the
+			// flat grey this replaces.
+			FStaticMaterial GMat;
+			GMat.MaterialInterface = GroundMat;
+			SM->GetStaticMaterials().Add(GMat);
 			PrepareMesh(SM, MD, MD.Triangles().Num());
 			OutPending.Add(SM);
 

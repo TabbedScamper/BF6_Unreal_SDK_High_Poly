@@ -26,6 +26,8 @@ namespace
 	typedef int (*FnWater)(bf6_ctx*, const char*, bf6_water*, int);
 	typedef int (*FnVarLive)(bf6_ctx*, const char*, const char*, const char*);
 	typedef int (*FnWaterSim)(bf6_ctx*, const char*, bf6_water_sim*);
+	typedef int (*FnBakeGround)(bf6_ctx*, const char*, const bf6_terrain_bake_opts*,
+	                            bf6_terrain_bake*, char*, int);
 	typedef int (*FnDecals)(bf6_ctx*, const char*, bf6_decal*, int);
 
 	FnOpen      GOpen      = nullptr;
@@ -42,6 +44,7 @@ namespace
 	FnWater     GWater     = nullptr;
 	FnVarLive   GVarLive   = nullptr;
 	FnWaterSim  GWaterSim  = nullptr;
+	FnBakeGround GBakeGround = nullptr;
 
 	// The C callback the core drives. Stores and returns; no UI, no allocation
 	// beyond the string, because this runs on the core's worker threads.
@@ -86,6 +89,7 @@ bool FCore::Open(const FString& GameDir, const FString& DllPath)
 	GWater       = (FnWater)     FPlatformProcess::GetDllExport(Dll, TEXT("bf6_level_water"));
 	GVarLive     = (FnVarLive)   FPlatformProcess::GetDllExport(Dll, TEXT("bf6_variation_live"));
 	GWaterSim    = (FnWaterSim)  FPlatformProcess::GetDllExport(Dll, TEXT("bf6_level_water_sim"));
+	GBakeGround  = (FnBakeGround)FPlatformProcess::GetDllExport(Dll, TEXT("bf6_bake_terrain"));
 	if (!GOpen || !GOpenLevel || !GInstances)
 	{
 		// The tool ships a core too, and an older one has no bf6_open_level.
@@ -277,6 +281,41 @@ bool FCore::ReadDecals(const FString& Level, TArray<FDecal>& Out)
 	return Out.Num() > 0;
 }
 
+
+bool FCore::BakeGround(const FString& Level, const FVector2D& RectMin, float RectSize,
+                       int32 Size, FGroundBake& Out)
+{
+	Out = FGroundBake();
+	Error.Reset();
+	if (!Ctx || !GBakeGround) { Error = TEXT("this bf6_core.dll has no ground bake"); return false; }
+
+	bf6_terrain_bake_opts o{};
+	o.rect_min[0] = (float)RectMin.X;
+	o.rect_min[1] = (float)RectMin.Y;
+	o.rect_size   = RectSize;
+	o.size        = Size;
+	o.want_normal = 1;
+	o.stochastic  = 1;
+	o.colour_map  = 1;
+
+	bf6_terrain_bake b{};
+	char err[512] = {0};
+	if (!GBakeGround(Ctx, TCHAR_TO_UTF8(*Level), &o, &b, err, sizeof(err)))
+	{
+		Error = UTF8_TO_TCHAR(err);
+		return false;
+	}
+	Out.Size = b.size;
+	Out.Lo = FVector2D(b.lo[0], b.lo[1]);
+	Out.Hi = FVector2D(b.hi[0], b.hi[1]);
+	Out.MetresPerTexel = b.metres_per_texel;
+	Out.Albedo = b.albedo;
+	Out.Normal = b.normal;
+	Out.LayersUsed = b.layers_used;
+	Out.LayersTextured = b.layers_textured;
+	Out.FallbackFraction = b.fallback_fraction;
+	return Out.Albedo != nullptr && Out.Size > 0;
+}
 
 bool FCore::ReadWaterSim(const FString& Level, FWaterSim& Out)
 {

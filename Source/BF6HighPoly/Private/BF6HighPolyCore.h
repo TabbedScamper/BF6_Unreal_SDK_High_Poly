@@ -208,6 +208,25 @@ namespace BF6HP
 		};
 		bool ReadWaterSim(const FString& Level, FWaterSim& Out);
 
+		// The ground, composited from the game's own layer materials. A bake
+		// rather than a live shader: the renderer drapes it over the
+		// heightfield. Pixels are RGBA8 and sRGB-encoded; the buffers belong
+		// to the core and stay valid until the next bake.
+		struct FGroundBake
+		{
+			int32   Size = 0;
+			FVector2D Lo = FVector2D::ZeroVector;   // world XZ, metres
+			FVector2D Hi = FVector2D::ZeroVector;
+			float   MetresPerTexel = 0.f;
+			const uint8* Albedo = nullptr;
+			const uint8* Normal = nullptr;
+			int32   LayersUsed = 0, LayersTextured = 0;
+			float   FallbackFraction = 0.f;
+		};
+		// RectSize <= 0 bakes the whole map footprint.
+		bool BakeGround(const FString& Level, const FVector2D& RectMin, float RectSize,
+		                int32 Size, FGroundBake& Out);
+
 		static FString MeshResourceFor(const FString& PlacementPath);
 
 		FString Error;
