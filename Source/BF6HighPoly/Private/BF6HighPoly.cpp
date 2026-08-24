@@ -1829,10 +1829,24 @@ namespace
 
 	// Per-metre strengths for Unreal's two water coefficients. The HUE and
 	// the BRIGHTNESS below come from the level's own authored colour; these
-	// two numbers are CALIBRATION and are labelled as such so nobody later
-	// mistakes them for something recovered from the game.
-	float ScatterPerM = 0.60f;
-	float AbsorbPerM  = 0.55f;
+	// numbers are CALIBRATION and are labelled so nobody later mistakes them
+	// for something recovered from the game.
+	//
+	// SCATTERING IS SMALL. This was 0.60 per metre, and half a unit of
+	// scattering per metre is roughly what milk does: the sea came out
+	// opaque and white. Sea water scatters about a tenth of that. The
+	// brightness of tropical water is not the volume glowing, it is the
+	// BOTTOM showing through - absorption kills red over a couple of metres
+	// while blue-green survives twenty, and what comes back up is the sand
+	// seen through a blue filter. So scattering stays low and absorption
+	// carries the colour.
+	float ScatterPerM = 0.055f;
+	float AbsorbPerM  = 0.50f;
+	// The surface's own diffuse albedo. Water is a REFLECTOR, not a diffuser:
+	// this belongs near black. It was near-black once, produced black water,
+	// and was then pushed almost to white, which produced the milk. The
+	// actual answer was never the base colour - it was the scattering.
+	float SurfaceAlbedo = 0.06f;
 
 	UMaterialInstanceDynamic* WaterMaterialFor(UObject* Outer, const BF6HP::FCore::FWater& W,
 	                                           const FWaveSet* Waves)
@@ -1908,14 +1922,10 @@ namespace
 		// magnitude and a linear mapping makes every dark water pitch black.
 		const float Bright = FMath::Sqrt(FMath::Clamp(Peak, 0.f, 1.f));
 
-		// The surface albedo the deferred pass would receive in the game.
-		// Hue keeps the map's character; the brightness floor stops a dark
-		// authored colour from rendering as a black mirror, which is what
-		// happened when this was left at its near-black default.
+		// A dark, tinted surface albedo. The colour a viewer sees comes from
+		// the volume and from whatever is under the water, not from this.
 		MID->SetVectorParameterValue(TEXT("SurfaceTint"), FLinearColor(
-			Hue.R * FMath::Max(Bright, 0.35f),
-			Hue.G * FMath::Max(Bright, 0.35f),
-			Hue.B * FMath::Max(Bright, 0.35f)));
+			Hue.R * SurfaceAlbedo, Hue.G * SurfaceAlbedo, Hue.B * SurfaceAlbedo));
 
 		// SCATTERING is what comes back out: the water's own colour, at a
 		// strength set by how bright the map authored it.
