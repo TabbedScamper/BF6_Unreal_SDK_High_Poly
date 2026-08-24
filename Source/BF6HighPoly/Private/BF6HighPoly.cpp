@@ -31,6 +31,8 @@
 #include "Materials/MaterialExpressionCustom.h"
 #include "Materials/MaterialExpressionWorldPosition.h"
 #include "Materials/MaterialExpressionTime.h"
+#include "Materials/MaterialExpressionLinearInterpolate.h"
+#include "Materials/MaterialExpressionConstant3Vector.h"
 #include "Materials/MaterialFunction.h"
 #include "UObject/UObjectIterator.h"
 #include "Brushes/SlateRoundedBoxBrush.h"
@@ -1270,6 +1272,11 @@ namespace
 		UMaterialExpressionScalarParameter* Gn = Scal(TEXT("WaveGain"), 0.f, 860);
 		UMaterialExpressionScalarParameter* Ch = Scal(TEXT("WaveChop"), 0.4f, 920);
 		UMaterialExpressionScalarParameter* Bl = Scal(TEXT("WaveBaseLen"), 26.f, 980);
+		// The game's own foam controls, straight off the recovered
+		// WaterDiffConstants: threshold at +8, max at +12. Foam is the
+		// LINEARISED JACOBIAN of the horizontal displacement, thresholded.
+		UMaterialExpressionScalarParameter* FTh = Scal(TEXT("FoamThreshold"), 8.f, 1040);
+		UMaterialExpressionScalarParameter* FMx = Scal(TEXT("FoamMax"), 1.f, 1100);
 
 		UMaterialExpressionCustom* WpoX =
 			Cast<UMaterialExpressionCustom>(
@@ -1298,6 +1305,69 @@ namespace
 			M->bTangentSpaceNormal = false;
 		}
 
+		// ---- FOAM, from the folding of the displacement field -------------
+		if (WP && Tm && Gn && Ch && Bl && FTh && FMx && Wv[0])
+		{
+			UMaterialExpressionCustom* FoamX =
+				Cast<UMaterialExpressionCustom>(
+					UMaterialEditingLibrary::CreateMaterialExpression(
+						M, UMaterialExpressionCustom::StaticClass(), -300, 1160));
+			if (FoamX)
+			{
+				FoamX->Code = TEXT("// Folding, the way csWaterOceanDiff computes it: the divergence of the\n// horizontal displacement field. BF6 applies that displacement with a\n// MINUS sign (the thickness pass reconstructs p = grid - scale*D), so\n// foam belongs on POSITIVE divergence. Get the sign wrong and foam\n// collects in the troughs instead of on the crests.\nfloat div = 0.0;\nfloat4 w[8] = {W0,W1,W2,W3,W4,W5,W6,W7};\nfloat2 pm = WPos.xy * 0.01;\nfor (int i = 0; i < 8; i++) {\n  float2 d = normalize(w[i].xy + float2(1e-5, 0));\n  float A = w[i].z * Gain;\n  float len = max(w[i].w * BaseLen, 1.0);\n  float k = 6.2831853 / len;\n  float ph = k * dot(d, pm) - sqrt(9.81 * k) * T;\n  div += Chop * A * k * sin(ph);\n}\n// foam = max(0, fold - threshold) * max, the recovered form. The\n// authored threshold is on the sim's own scale (0..290 game-wide), so\n// it is normalised here rather than used raw.\nfloat fold = div;\nreturn saturate(max(0.0, fold - Thr * 0.02) * Mx);");
+				FoamX->OutputType = CMOT_Float1;
+				FoamX->Description = TEXT("BF6 Jacobian foam");
+				FoamX->Inputs.Empty();
+				auto In = [&FoamX](const TCHAR* Nm, UMaterialExpression* E)
+				{
+					FCustomInput I; I.InputName = Nm; I.Input.Expression = E;
+					FoamX->Inputs.Add(I);
+				};
+				In(TEXT("WPos"), WP);
+				In(TEXT("T"), Tm);
+				const TCHAR* WN[8] = { TEXT("W0"), TEXT("W1"), TEXT("W2"), TEXT("W3"),
+				                       TEXT("W4"), TEXT("W5"), TEXT("W6"), TEXT("W7") };
+				for (int32 i = 0; i < 8; i++) In(WN[i], Wv[i]);
+				In(TEXT("Gain"), Gn);
+				In(TEXT("Chop"), Ch);
+				In(TEXT("BaseLen"), Bl);
+				In(TEXT("Thr"), FTh);
+				In(TEXT("Mx"), FMx);
+
+				// Foam is white, rough and unlit-ish: it rides over the water
+				// colour rather than tinting it, so it goes through BaseColor
+				// and Roughness rather than through the water volume.
+				UMaterialExpressionLinearInterpolate* FoamMix =
+					Cast<UMaterialExpressionLinearInterpolate>(
+						UMaterialEditingLibrary::CreateMaterialExpression(
+							M, UMaterialExpressionLinearInterpolate::StaticClass(), -100, 60));
+				UMaterialExpressionConstant3Vector* FoamCol =
+					Cast<UMaterialExpressionConstant3Vector>(
+						UMaterialEditingLibrary::CreateMaterialExpression(
+							M, UMaterialExpressionConstant3Vector::StaticClass(), -300, 20));
+				if (FoamMix && FoamCol && Tint)
+				{
+					FoamCol->Constant = FLinearColor(0.78f, 0.82f, 0.84f);
+					UMaterialEditingLibrary::ConnectMaterialExpressions(Tint, TEXT(""), FoamMix, TEXT("A"));
+					UMaterialEditingLibrary::ConnectMaterialExpressions(FoamCol, TEXT(""), FoamMix, TEXT("B"));
+					UMaterialEditingLibrary::ConnectMaterialExpressions(FoamX, TEXT(""), FoamMix, TEXT("Alpha"));
+					UMaterialEditingLibrary::ConnectMaterialProperty(FoamMix, TEXT(""), MP_BaseColor);
+				}
+				// foam kills the mirror finish where it sits
+				UMaterialExpressionLinearInterpolate* RoughMix =
+					Cast<UMaterialExpressionLinearInterpolate>(
+						UMaterialEditingLibrary::CreateMaterialExpression(
+							M, UMaterialExpressionLinearInterpolate::StaticClass(), -100, 200));
+				if (RoughMix && Rough)
+				{
+					UMaterialEditingLibrary::ConnectMaterialExpressions(Rough, TEXT(""), RoughMix, TEXT("A"));
+					UMaterialEditingLibrary::ConnectMaterialExpressions(FoamX, TEXT(""), RoughMix, TEXT("Alpha"));
+					// B defaults to 1 = fully rough foam
+					UMaterialEditingLibrary::ConnectMaterialProperty(RoughMix, TEXT(""), MP_Roughness);
+				}
+			}
+		}
+
 		M->PreEditChange(nullptr);
 		M->PostEditChange();
 		UE_LOG(LogBF6HighPoly, Log, TEXT("water material: complete=%d"), M->IsComplete() ? 1 : 0);
@@ -1318,6 +1388,8 @@ namespace
 	{
 		FLinearColor W[8];
 		float Gain = 0.f, Chop = 0.4f, BaseLen = 26.f;
+		// The game's own foam controls, carried through from the sim entity.
+		float FoamThreshold = 8.f, FoamMax = 1.f;
 		bool  bValid = false;
 	};
 
@@ -1379,6 +1451,10 @@ namespace
 		// folds crests into themselves.
 		R.Chop = FMath::Clamp(S.Choppiness, 0.05f, 0.9f);
 		R.BaseLen = bOcean ? 34.f : 22.f;
+		// Straight from the level: EnableFoam gates it, and a level that
+		// authors FoamMaxValue 0 genuinely wants none.
+		R.FoamThreshold = S.FoamThreshold;
+		R.FoamMax = S.FoamMax > 0.f ? S.FoamMax : 0.f;
 		R.bValid = true;
 		return R;
 	}
@@ -1403,6 +1479,8 @@ namespace
 			MID->SetScalarParameterValue(TEXT("WaveGain"), Waves->Gain);
 			MID->SetScalarParameterValue(TEXT("WaveChop"), Waves->Chop);
 			MID->SetScalarParameterValue(TEXT("WaveBaseLen"), Waves->BaseLen);
+			MID->SetScalarParameterValue(TEXT("FoamThreshold"), Waves->FoamThreshold);
+			MID->SetScalarParameterValue(TEXT("FoamMax"), Waves->FoamMax);
 		}
 		FLinearColor Shallow = W.Shallow.R >= 0.f ? W.Shallow : FLinearColor(0.11f, 0.34f, 0.36f);
 		FLinearColor Deep    = W.Deep.R    >= 0.f ? W.Deep
