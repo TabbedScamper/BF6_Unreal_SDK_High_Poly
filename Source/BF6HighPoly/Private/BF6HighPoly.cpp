@@ -1526,7 +1526,7 @@ namespace
 		// Ratio is a function-scope STATIC, so it has static storage duration
 		// and must not be named in the capture list - it is reachable without
 		// one. Capturing it is a hard error, not a warning.
-		auto Fan = [&R, &n](float BaseAng, float Amp)
+		auto Fan = [&R, &n, &Lead](float BaseAng, float Amp)
 		{
 			const float Off = FMath::DegreesToRadians(
 				46.f * (FMath::Fmod((float)n * 0.61803399f, 1.f) - 0.5f));
@@ -1589,6 +1589,49 @@ namespace
 	// Metres over which the authored colour is reached. The game carries this
 	// per material (CB1[0].w); we have no reader for it yet, so it is one
 	// number here rather than a guess dressed as data.
+	// The terrain's heights as a texture, so the water surface can ask how
+	// deep it is at any point. The game does the same thing through a
+	// virtual-texture heightfield fetch.
+	UTexture2D* GWaterDepthTex = nullptr;
+	FVector2D   GWaterDepthMin = FVector2D::ZeroVector;   // world XZ of texel 0
+	FVector2D   GWaterDepthSpan = FVector2D(1, 1);
+
+	UTexture2D* MakeDepthTexture(const BF6HP::FCore::FTerrain& T)
+	{
+		if (T.Size <= 1 || T.Heights.Num() < T.Size * T.Size) return nullptr;
+		// A quarter of the native side is plenty: this drives an amplitude
+		// fade, not geometry.
+		const int32 N = FMath::Clamp(T.Size / 4, 64, 1024);
+		UTexture2D* Tex = UTexture2D::CreateTransient(N, N, PF_R32_FLOAT);
+		if (!Tex) return nullptr;
+		Tex->SRGB = false;
+		Tex->CompressionSettings = TC_HDR;
+		Tex->AddressX = TA_Clamp;
+		Tex->AddressY = TA_Clamp;
+		Tex->Filter = TF_Bilinear;
+		const double YScale = T.HeightScale > 0.f
+			? (double)T.HeightScale / 65536.0
+			: FMath::Max(0.001, T.WorldMax.Y - T.WorldMin.Y) / 65535.0;
+		if (float* P = (float*)Tex->GetPlatformData()->Mips[0].BulkData.Lock(LOCK_READ_WRITE))
+		{
+			for (int32 y = 0; y < N; y++)
+				for (int32 x = 0; x < N; x++)
+				{
+					const int32 sx = FMath::Min(T.Size - 1, x * T.Size / N);
+					const int32 sy = FMath::Min(T.Size - 1, y * T.Size / N);
+					P[y * N + x] = (float)(T.Heights[sy * T.Size + sx] * YScale + T.WorldMin.Y);
+				}
+			Tex->GetPlatformData()->Mips[0].BulkData.Unlock();
+		}
+		Tex->UpdateResource();
+		Tex->AddToRoot();
+		GWaterDepthMin = FVector2D(T.WorldMin.X, T.WorldMin.Z);
+		GWaterDepthSpan = FVector2D(
+			FMath::Max(1.0, T.WorldMax.X - T.WorldMin.X),
+			FMath::Max(1.0, T.WorldMax.Z - T.WorldMin.Z));
+		return Tex;
+	}
+
 	// Per-metre strengths for Unreal's two water coefficients. The HUE and
 	// the BRIGHTNESS below come from the level's own authored colour; these
 	// two numbers are CALIBRATION and are labelled as such so nobody later
@@ -1684,49 +1727,6 @@ namespace
 			(1.f - Hue.G) * AbsorbPerM + 0.02f,
 			(1.f - Hue.B) * AbsorbPerM + 0.02f));
 		return MID;
-	}
-
-	// The terrain's heights as a texture, so the water surface can ask how
-	// deep it is at any point. The game does the same thing through a
-	// virtual-texture heightfield fetch.
-	UTexture2D* GWaterDepthTex = nullptr;
-	FVector2D   GWaterDepthMin = FVector2D::ZeroVector;   // world XZ of texel 0
-	FVector2D   GWaterDepthSpan = FVector2D(1, 1);
-
-	UTexture2D* MakeDepthTexture(const BF6HP::FCore::FTerrain& T)
-	{
-		if (T.Size <= 1 || T.Heights.Num() < T.Size * T.Size) return nullptr;
-		// A quarter of the native side is plenty: this drives an amplitude
-		// fade, not geometry.
-		const int32 N = FMath::Clamp(T.Size / 4, 64, 1024);
-		UTexture2D* Tex = UTexture2D::CreateTransient(N, N, PF_R32_FLOAT);
-		if (!Tex) return nullptr;
-		Tex->SRGB = false;
-		Tex->CompressionSettings = TC_HDR;
-		Tex->AddressX = TA_Clamp;
-		Tex->AddressY = TA_Clamp;
-		Tex->Filter = TF_Bilinear;
-		const double YScale = T.HeightScale > 0.f
-			? (double)T.HeightScale / 65536.0
-			: FMath::Max(0.001, T.WorldMax.Y - T.WorldMin.Y) / 65535.0;
-		if (float* P = (float*)Tex->GetPlatformData()->Mips[0].BulkData.Lock(LOCK_READ_WRITE))
-		{
-			for (int32 y = 0; y < N; y++)
-				for (int32 x = 0; x < N; x++)
-				{
-					const int32 sx = FMath::Min(T.Size - 1, x * T.Size / N);
-					const int32 sy = FMath::Min(T.Size - 1, y * T.Size / N);
-					P[y * N + x] = (float)(T.Heights[sy * T.Size + sx] * YScale + T.WorldMin.Y);
-				}
-			Tex->GetPlatformData()->Mips[0].BulkData.Unlock();
-		}
-		Tex->UpdateResource();
-		Tex->AddToRoot();
-		GWaterDepthMin = FVector2D(T.WorldMin.X, T.WorldMin.Z);
-		GWaterDepthSpan = FVector2D(
-			FMath::Max(1.0, T.WorldMax.X - T.WorldMin.X),
-			FMath::Max(1.0, T.WorldMax.Z - T.WorldMin.Z));
-		return Tex;
 	}
 
 	int32 GWaterBuilt = 0;
