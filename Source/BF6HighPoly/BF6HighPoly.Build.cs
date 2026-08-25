@@ -26,7 +26,11 @@ public class BF6HighPoly : ModuleRules
 		{
 			"Slate",
 			"SlateCore",
-			"InputCore"
+			"InputCore",
+			// GMaxRHIShaderPlatform, for the material self-check. The
+			// single-file compile does not link, so a missing module here
+			// shows up only in a real build.
+			"RHI"
 		});
 
 		if (Target.bBuildEditor)

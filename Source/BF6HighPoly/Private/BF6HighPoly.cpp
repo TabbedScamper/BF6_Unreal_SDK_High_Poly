@@ -13,6 +13,16 @@
 #include "StaticMeshAttributes.h"
 #include "StaticMeshOperations.h"
 #include "Engine/Texture2D.h"
+#include "Engine/Texture2DArray.h"
+#include "Components/PointLightComponent.h"
+#include "Components/SpotLightComponent.h"
+#include "Components/RectLightComponent.h"
+#include "Components/SkyLightComponent.h"
+#include "Components/DirectionalLightComponent.h"
+#include "Components/ExponentialHeightFogComponent.h"
+#include "Components/SkyAtmosphereComponent.h"
+#include "Engine/PostProcessVolume.h"
+#include "Engine/DirectionalLight.h"
 #include "TextureResource.h"   // FTexture2DMipMap, for the mip BulkData walk
 #include "PixelFormat.h"
 #include "Materials/Material.h"
@@ -28,6 +38,9 @@
 #include "Materials/MaterialExpressionOneMinus.h"
 #include "Materials/MaterialExpressionMaterialFunctionCall.h"
 #include "Materials/MaterialExpressionSingleLayerWaterMaterialOutput.h"
+#include "Materials/MaterialExpressionCustomOutput.h"
+#include "Materials/MaterialExpressionConstant.h"
+#include "Materials/MaterialExpressionThinTranslucentMaterialOutput.h"
 #include "Materials/MaterialExpressionCustom.h"
 #include "Materials/MaterialExpressionWorldPosition.h"
 #include "Materials/MaterialExpressionTime.h"
@@ -41,6 +54,9 @@
 #include "Widgets/Layout/SWrapBox.h"
 #include "MaterialDomain.h"
 #include "MaterialEditingLibrary.h"
+#include "Materials/MaterialInterface.h"
+#include "MaterialShared.h"
+#include "AssetCompilingManager.h"
 #include "UObject/Package.h"
 #include "Editor.h"
 #include "EngineUtils.h"
@@ -180,8 +196,21 @@ namespace
 		// a linear normal as sRGB is the classic "lighting looks wrong and
 		// nothing is obviously broken" bug.
 		Tex->SRGB = T.bSrgb;
+		// BC6H IS HDR, and it is neither a colour sheet nor a mask.
+		//
+		// The sky panorama arrives here as BC6H and the two-way choice below
+		// would file it as TC_Masks, which is the setting for a packed
+		// non-colour sheet. TC_HDR is what a float format wants, and SRGB must
+		// be off or the values are decoded twice.
+		const EPixelFormat Pf = PixelFormatOf(T.Format);
+		if (Pf == PF_BC6H || Pf == PF_FloatRGBA)
+		{
+			Tex->SRGB = false;
+		}
 		Tex->NeverStream = true;
-		Tex->CompressionSettings = T.bSrgb ? TC_Default : TC_Masks;
+		Tex->CompressionSettings =
+			(Pf == PF_BC6H || Pf == PF_FloatRGBA) ? TC_HDR
+			: (T.bSrgb ? TC_Default : TC_Masks);
 
 		FTexturePlatformData* PD = Tex->GetPlatformData();
 
@@ -360,6 +389,27 @@ namespace
 		{
 			M->BlendMode = BLEND_Translucent;
 			M->TranslucencyLightingMode = TLM_SurfacePerPixelLighting;
+			// GLASS IS A THIN SLAB, not a faded solid.
+			//
+			// A plain translucent surface at opacity 0.25 is a grey film: it
+			// scales the whole shaded result down, highlight included, and it
+			// has no idea which way you are looking through it. Thin
+			// Translucent is the model for exactly this case and the engine
+			// already ships it (ThinTranslucentCommon.ush):
+			//     PathLength   = 1 / NoV
+			//     Transmittance = exp(log(TransmittanceColor) * PathLength)
+			//     Transmittance *= (1 - Fresnel) twice, once per interface
+			// so it gives COLOURED transmission, thickness that grows at
+			// grazing angles, and Fresnel on both faces, with dual source
+			// blending so the specular highlight is not dimmed by the
+			// transparency. That is what glass does and a constant opacity is
+			// not.
+			//
+			// The engine enforces four things for this model
+			// (MaterialShared.cpp:6451-6470): a translucent blend, per pixel
+			// surface lighting, this shading model ALONE, and the presence of
+			// a ThinTranslucentMaterialOutput node. All four are set here.
+			M->SetShadingModel(MSM_ThinTranslucent);
 		}
 		else if (Kind == EKind::Road)
 		{
@@ -391,7 +441,16 @@ namespace
 			AddParam(TEXT("BaseColor"), SAMPLERTYPE_Color, 0);
 		UMaterialExpressionTextureSampleParameter2D* Norm =
 			AddParam(TEXT("Normal"),
-				Kind == EKind::Vista ? SAMPLERTYPE_LinearColor : SAMPLERTYPE_Normal, 300);
+				// ROADS TAKE THE VISTA TREATMENT TOO. A road decal binds an
+				// "_nhs" sheet - normal, height, smoothness - which is the
+				// same packing as the vista's "_nsm" for the two channels
+				// either of them reads: RG is the tangent normal's XY and A is
+				// smoothness. Only the unread middle channel differs, height
+				// against wetness. Sampled as a NORMAL map the whole RGB goes
+				// into the normal pin, so the height channel is read as Z and
+				// the smoothness is thrown away.
+				(Kind == EKind::Vista || Kind == EKind::Road)
+					? SAMPLERTYPE_LinearColor : SAMPLERTYPE_Normal, 300);
 
 		// A parameter with no default texture compiles to nothing useful, so
 		// each gets a neutral one: white for colour, flat for the normal.
@@ -400,7 +459,7 @@ namespace
 		// normal-compressed default fails the same compile-time check the
 		// sRGB white does - so it defaults to our linear white instead. It is
 		// never sampled once a real sheet is bound.
-		if (Norm) Norm->Texture = Kind == EKind::Vista
+		if (Norm) Norm->Texture = (Kind == EKind::Vista || Kind == EKind::Road)
 			? LinearWhite()
 			: LoadObject<UTexture2D>(nullptr, TEXT("/Engine/EngineMaterials/DefaultNormal.DefaultNormal"));
 
@@ -437,7 +496,7 @@ namespace
 		{
 			UMaterialEditingLibrary::ConnectMaterialProperty(Base, TEXT(""), MP_BaseColor);
 		}
-		if (Norm && Kind == EKind::Vista)
+		if (Norm && (Kind == EKind::Vista || Kind == EKind::Road))
 		{
 			// REBUILT FROM RG, ROUGHNESS FROM A. The sheet is linear RGBA:
 			// RG holds the tangent normal's XY, so Z is derived; A is
@@ -481,7 +540,7 @@ namespace
 		// a car that is not glossy does not read as a car. NOT on vista: there
 		// the roughness is per-pixel from the NSM alpha, wired above, and a
 		// second connection here would overwrite it.
-		if (Kind != EKind::Vista)
+		if (Kind != EKind::Vista && Kind != EKind::Road)
 		if (UMaterialExpressionScalarParameter* Rough =
 				Cast<UMaterialExpressionScalarParameter>(
 					UMaterialEditingLibrary::CreateMaterialExpression(
@@ -528,6 +587,32 @@ namespace
 					UMaterialEditingLibrary::ConnectMaterialExpressions(WInt, TEXT(""), Call, TEXT("WindIntensity"));
 					UMaterialEditingLibrary::ConnectMaterialExpressions(WInt, TEXT(""), Call, TEXT("WindWeight"));
 					UMaterialEditingLibrary::ConnectMaterialExpressions(WSpd, TEXT(""), Call, TEXT("WindSpeed"));
+					// ADDITIONALWPO IS REQUIRED, and leaving it off cost every
+					// map its vegetation.
+					//
+					// SimpleGrassWind declares this input with no default, so
+					// an unconnected pin is not "use zero" - it is a compile
+					// ERROR, "Missing function input 'AdditionalWPO'", and the
+					// whole material then falls back to Unreal's default:
+					//   Failed to compile Material for platform PCD3D_SM6,
+					//   Default Material will be used in game.
+					// Which is to say every masked vegetation card in the map
+					// was drawing as the engine default rather than as a leaf.
+					// It went unnoticed for as long as it did because nothing
+					// ever asked this material whether it had compiled.
+					//
+					// Zero is the right value: it is the extra displacement to
+					// add on top of the wind, and we have none.
+					UMaterialExpressionConstant3Vector* NoExtraWPO =
+						Cast<UMaterialExpressionConstant3Vector>(
+							UMaterialEditingLibrary::CreateMaterialExpression(
+								M, UMaterialExpressionConstant3Vector::StaticClass(), -700, 1020));
+					if (NoExtraWPO)
+					{
+						NoExtraWPO->Constant = FLinearColor(0.f, 0.f, 0.f);
+						UMaterialEditingLibrary::ConnectMaterialExpressions(
+							NoExtraWPO, TEXT(""), Call, TEXT("AdditionalWPO"));
+					}
 					UMaterialEditingLibrary::ConnectMaterialProperty(Call, TEXT(""), MP_WorldPositionOffset);
 				}
 			}
@@ -569,7 +654,55 @@ namespace
 							M, UMaterialExpressionMultiply::StaticClass(), -200, 660));
 				if (OpMul)
 				{
-					UMaterialEditingLibrary::ConnectMaterialExpressions(Cov, TEXT("R"), OpMul, TEXT("A"));
+					// THE MASK IS A PACKED ATLAS, so red is not always the
+					// coverage. One sheet holds three or four painted road
+					// words or arrows and each record picks one by an authored
+					// index; the sheets that use three or four values are all
+					// named "_rgb" and no single-mask sheet ever reaches 3.
+					// Taking R unconditionally is right about one record in
+					// three. MaskSelect defaults to red, so a record with no
+					// index behaves exactly as before.
+					UMaterialExpressionVectorParameter* Sel =
+						Cast<UMaterialExpressionVectorParameter>(
+							UMaterialEditingLibrary::CreateMaterialExpression(
+								M, UMaterialExpressionVectorParameter::StaticClass(), -700, 840));
+					UMaterialExpressionCustom* Pick =
+						Cast<UMaterialExpressionCustom>(
+							UMaterialEditingLibrary::CreateMaterialExpression(
+								M, UMaterialExpressionCustom::StaticClass(), -420, 700));
+					if (Sel && Pick)
+					{
+						Sel->ParameterName = TEXT("MaskSelect");
+						Sel->DefaultValue = FLinearColor(1.f, 0.f, 0.f, 0.f);
+						Pick->Description = TEXT("BF6 packed mask channel");
+						Pick->OutputType = CMOT_Float1;
+						// FOUR SCALARS, NOT A SWIZZLE. A vector parameter's
+						// default output pin is RGB, a float3, so "Sel.a" is
+						// an out-of-bounds swizzle and the whole material
+						// fails to compile - which sends every road and decal
+						// to the engine default. Taking R, G, B and A as
+						// separate pins has no such ambiguity.
+						Pick->Code = TEXT("return R * SelR + G * SelG + B * SelB + A * SelA;");
+						Pick->Inputs.Empty();
+						// Output indices 1..4 on a texture sample are R, G, B
+						// and A; index 0 is RGB.
+						FCustomInput In;
+						In.InputName = TEXT("R"); In.Input.Expression = Cov; In.Input.OutputIndex = 1; Pick->Inputs.Add(In);
+						In.InputName = TEXT("G"); In.Input.OutputIndex = 2; Pick->Inputs.Add(In);
+						In.InputName = TEXT("B"); In.Input.OutputIndex = 3; Pick->Inputs.Add(In);
+						In.InputName = TEXT("A"); In.Input.OutputIndex = 4; Pick->Inputs.Add(In);
+						FCustomInput SIn;
+						SIn.Input.Expression = Sel;
+						SIn.InputName = TEXT("SelR"); SIn.Input.OutputIndex = 1; Pick->Inputs.Add(SIn);
+						SIn.InputName = TEXT("SelG"); SIn.Input.OutputIndex = 2; Pick->Inputs.Add(SIn);
+						SIn.InputName = TEXT("SelB"); SIn.Input.OutputIndex = 3; Pick->Inputs.Add(SIn);
+						SIn.InputName = TEXT("SelA"); SIn.Input.OutputIndex = 4; Pick->Inputs.Add(SIn);
+						UMaterialEditingLibrary::ConnectMaterialExpressions(Pick, TEXT(""), OpMul, TEXT("A"));
+					}
+					else
+					{
+						UMaterialEditingLibrary::ConnectMaterialExpressions(Cov, TEXT("R"), OpMul, TEXT("A"));
+					}
 					UMaterialEditingLibrary::ConnectMaterialExpressions(VC, TEXT("A"), OpMul, TEXT("B"));
 					UMaterialEditingLibrary::ConnectMaterialProperty(OpMul, TEXT(""), MP_Opacity);
 				}
@@ -591,18 +724,64 @@ namespace
 		}
 		else if (Kind == EKind::Translucent)
 		{
-			// Glass has no cutout sheet; its transparency is a constant the
-			// depot carries. A flat value is the honest first pass rather than
-			// inventing a per-pixel one.
-			UMaterialExpressionScalarParameter* Op =
+			// WHAT THE GLASS LETS THROUGH, as a colour rather than a fraction.
+			//
+			// TransmittanceColor is what survives a view PERPENDICULAR to the
+			// surface; the shader takes its log and scales by 1/NoV, so a
+			// grazing view goes darker on its own. Tinted glass is this
+			// parameter's whole job, and the depot's constant maps onto it as
+			// 1 minus the old opacity rather than onto MP_Opacity.
+			//
+			// SurfaceCoverage stays 1: it is how much of the pixel is glass at
+			// all, which is a cutout question, and glass carries no cutout
+			// sheet.
+			UMaterialExpressionThinTranslucentMaterialOutput* TT =
+				Cast<UMaterialExpressionThinTranslucentMaterialOutput>(
+					UMaterialEditingLibrary::CreateMaterialExpression(
+						M, UMaterialExpressionThinTranslucentMaterialOutput::StaticClass(),
+						100, 600));
+			UMaterialExpressionVectorParameter* Trans =
+				Cast<UMaterialExpressionVectorParameter>(
+					UMaterialEditingLibrary::CreateMaterialExpression(
+						M, UMaterialExpressionVectorParameter::StaticClass(), -400, 600));
+			if (Trans)
+			{
+				Trans->ParameterName = TEXT("TransmittanceColor");
+				// 0.75 grey is the old flat 0.25 opacity expressed as what gets
+				// through, so nothing changes brightness on day one and the
+				// per-record tint replaces it as the decode lands.
+				Trans->DefaultValue = FLinearColor(0.75f, 0.75f, 0.75f);
+			}
+			if (TT && Trans)
+			{
+				UMaterialEditingLibrary::ConnectMaterialExpressions(
+					Trans, TEXT(""), TT, TEXT("TransmittanceColor"));
+			}
+			UMaterialExpressionScalarParameter* Cov =
 				Cast<UMaterialExpressionScalarParameter>(
 					UMaterialEditingLibrary::CreateMaterialExpression(
-						M, UMaterialExpressionScalarParameter::StaticClass(), -400, 600));
-			if (Op)
+						M, UMaterialExpressionScalarParameter::StaticClass(), -400, 700));
+			if (Cov)
 			{
-				Op->ParameterName = TEXT("Opacity");
-				Op->DefaultValue = 0.25f;
-				UMaterialEditingLibrary::ConnectMaterialProperty(Op, TEXT(""), MP_Opacity);
+				Cov->ParameterName = TEXT("SurfaceCoverage");
+				Cov->DefaultValue = 1.f;
+				if (TT)
+				{
+					UMaterialEditingLibrary::ConnectMaterialExpressions(
+						Cov, TEXT(""), TT, TEXT("SurfaceCoverage"));
+				}
+				// Thin Translucent still reads MP_Opacity as the surface's
+				// own coverage, and it defaults to 1, which is what glass
+				// wants. Connected anyway so the root-input check can see it
+				// rather than reporting a pin on defaults.
+				UMaterialEditingLibrary::ConnectMaterialProperty(Cov, TEXT(""), MP_Opacity);
+			}
+			if (!TT)
+			{
+				UE_LOG(LogBF6HighPoly, Error,
+					TEXT("glass: no ThinTranslucentMaterialOutput node. The engine ")
+					TEXT("refuses to compile this shading model without one and the ")
+					TEXT("material will fall back to the default grey."));
 			}
 		}
 
@@ -662,6 +841,10 @@ namespace
 	// The material for one road record. Its sheets come straight off the record
 	// rather than through a shader state key, which is why this does not go
 	// through MaterialFor.
+	// Decal tints above 1.0 over a colour sheet, clamped rather than passed
+	// through. See RoadMaterialFor.
+	int32 GRoadTintClamped = 0;
+
 	UMaterialInstanceDynamic* RoadMaterialFor(UObject* Outer, const BF6HP::FCore::FDecal& D)
 	{
 		UMaterial* Parent = EnsureParentMaterial(EKind::Road);
@@ -672,6 +855,56 @@ namespace
 		if (UTexture2D* T = TextureFor(D.Albedo))  MID->SetTextureParameterValue(TEXT("BaseColor"), T);
 		if (UTexture2D* T = TextureFor(D.Normal))  MID->SetTextureParameterValue(TEXT("Normal"), T);
 		if (UTexture2D* T = TextureFor(D.Opacity)) MID->SetTextureParameterValue(TEXT("Opacity"), T);
+
+		// THE AUTHORED COLOUR, used two different ways.
+		//
+		// With a sheet bound the constant MULTIPLIES it, which is what the
+		// distribution says: a quarter to four fifths of those records push a
+		// channel past 1.0 and one reaches 61. With no sheet the BaseColor
+		// sampler stays at its white default, so the same constant becomes the
+		// colour itself and the mask decides where it lands.
+		if (D.bHasTint || D.bHasTint2)
+		{
+			FLinearColor C = D.bHasTint ? D.Tint : D.Tint2;
+			// A MULTIPLIER ABOVE 1 CANNOT BE PASSED THROUGH, and passing it
+			// through is what turned the carrier decks white.
+			//
+			// With a colour sheet bound the constant multiplies it, and the
+			// authored values run well past 1: on MP_Isolated 108 of the 448
+			// tinted records exceed 1.0 and the largest channel on the level
+			// is 61.1. Every one of those 108 is above y = 90 - the carrier
+			// decks - so a wet-deck sheet was being multiplied by 2.5 to 3.6
+			// and saturating to a solid white rectangle.
+			//
+			// A decal writes into the GBuffer's base colour, which is 0..1, so
+			// an unbounded brighten has nowhere to go here regardless. Clamped
+			// rather than renormalised: clamping costs the brightening and
+			// keeps the hue, where scaling the triple down would keep the
+			// brightening and change the colour.
+			//
+			// OPEN: what the game actually does with a multiplier of 61. That
+			// it is a multiplier at all is inferred from its distribution -
+			// 40.6% of values above 1.0 with a sheet bound against 1.2%
+			// without - not from the shader. If it turns out to drive
+			// something other than base colour, this clamp is the wrong shape
+			// rather than the wrong value.
+			if (D.Albedo >= 0)
+			{
+				C.R = FMath::Min(C.R, 1.f);
+				C.G = FMath::Min(C.G, 1.f);
+				if (C.R < D.Tint.R || C.G < D.Tint.G || C.B < D.Tint.B) GRoadTintClamped++;
+			}
+			MID->SetVectorParameterValue(TEXT("BaseColorTint"), C);
+		}
+
+		// WHICH CHANNEL OF THE MASK IS THIS RECORD'S COVERAGE. Unset means
+		// red, which is what the material already defaults to.
+		if (D.MaskChannel >= 0 && D.MaskChannel <= 3)
+		{
+			FLinearColor Sel(0.f, 0.f, 0.f, 0.f);
+			(&Sel.R)[D.MaskChannel] = 1.f;
+			MID->SetVectorParameterValue(TEXT("MaskSelect"), Sel);
+		}
 		return MID;
 	}
 
@@ -883,7 +1116,7 @@ namespace
 	// point of it is that a creator can take the real world apart while looking
 	// at it. Only layers that actually exist are listed: an inert switch for
 	// something unported would be a lie told in the interface.
-	enum class ELayer : uint8 { Terrain, Roads, Objects, Water, Count };
+	enum class ELayer : uint8 { Terrain, Roads, Objects, Water, Lighting, Count };
 
 	struct FLayer
 	{
@@ -897,6 +1130,7 @@ namespace
 		{ TEXT("Roads"), TEXT("Lane markings, crossings, mud and wear, draped on the ground. The road surface itself is the terrain; this is what is painted on it.") },
 		{ TEXT("Objects"), TEXT("Every prop, building and fixture the level places, at its real transform. Preview only.") },
 		{ TEXT("Water"), TEXT("The level's water surfaces, at the game's own heights and colours, drawn with Unreal's real water shading - depth absorption, reflections, refraction.") },
+		{ TEXT("Lighting"), TEXT("The map's own lighting: the authored sun angle, colour and illuminance, its sky and fog, and every lamp, spot and lit panel the level places. Preview only.") },
 	};
 
 	bool GHideLowPoly = true;
@@ -906,9 +1140,10 @@ namespace
 	// closes underneath us.
 	const TCHAR* LayerPrefix(ELayer L)
 	{
-		return L == ELayer::Terrain ? TEXT("Terrain")
-			 : L == ELayer::Roads   ? TEXT("RoadMesh_")
-			 : L == ELayer::Water   ? TEXT("Water_") : TEXT("I_");
+		return L == ELayer::Terrain  ? TEXT("Terrain")
+			 : L == ELayer::Roads    ? TEXT("RoadMesh_")
+			 : L == ELayer::Water    ? TEXT("Water_")
+			 : L == ELayer::Lighting ? TEXT("Light_") : TEXT("I_");
 	}
 
 	void ApplyLayer(ELayer L)
@@ -997,7 +1232,7 @@ namespace
 	// Ground bake resolution. 2048 over a 4 km map is about two metres a
 	// texel, which reads correctly from the air and softens underfoot; the
 	// cost is 16 MB of RGBA per sheet.
-	int32 GGroundBakeSize = 2048;
+	int32 GGroundBakeSize = 2048;   // replaced per map by SizeForExtent()
 
 	// ---- the ground, from the game's own layer materials -----------------
 	//
@@ -1009,6 +1244,25 @@ namespace
 	// world rectangle is exact.
 	UMaterial* GGroundParent = nullptr;
 	UTexture2D* GGroundAlbedo = nullptr;
+
+	// THE GROUND BEYOND THE PLAYABLE BOX.
+	//
+	// The coverage raster and the near bake are both cropped to the playable
+	// box, which is right - it is what buys 0.62 m a texel instead of 2.00.
+	// But the terrain MESH is built over the whole heightfield: on MP_Isolated
+	// that is 8,192 m of ground against a 2,555 m box, so by AREA about 90% of
+	// the terrain lies outside the textured window, samples outside 0..1, and
+	// clamps to a border texel. It reads as the whole map being smeared.
+	//
+	// So the far field gets its own bake over the full footprint. It is coarse
+	// on purpose - 8 m a texel on a 4 km map - because it is only ever seen
+	// past the box edge, and the near path keeps every bit of its density.
+	UTexture2D* GGroundFar = nullptr;
+	FVector2D   GFarLo = FVector2D::ZeroVector;
+	FVector2D   GFarSpan = FVector2D(1, 1);
+	// The playable box in world XZ, so the shader knows where to cross over.
+	FVector2D   GBoxCentre = FVector2D::ZeroVector;
+	FVector2D   GBoxHalf = FVector2D(1, 1);
 	UTexture2D* GGroundNormal = nullptr;
 
 	UMaterial* EnsureGroundMaterial()
@@ -1110,30 +1364,184 @@ namespace
 
 		M->PreEditChange(nullptr);
 		M->PostEditChange();
+		// ROOTED, because this is a raw global pointing at a transient object.
+		// Every texture below is already rooted; the materials were not, so a
+		// garbage collection between two builds - a map load is enough - left
+		// both globals dangling and the next build read freed memory. That is
+		// an access violation on 0xffffffffffffffff, and it took a crash in
+		// the self-check to notice.
+		M->AddToRoot();
 		GGroundParent = M;
 		return M;
 	}
 
-	// One RGBA8 texture from a bake buffer.
-	UTexture2D* MakeBakeTexture(const uint8* Pixels, int32 N, bool bSrgb)
+	// A square RGBA8 texture WITH A MIP CHAIN, from tightly packed source.
+	//
+	// UTexture2D::CreateTransient allocates exactly one mip and there is no
+	// parameter to ask for more, so anything built through it has no mip to
+	// fall to under minification. On a full-screen blit that is invisible; on
+	// ground seen from a distance it is not, because a 2048-texel raster
+	// stretched over four kilometres puts many texels under one screen pixel
+	// and the sampler just picks one of them. That reads as PIXELATION that
+	// appears as you back away and is absent up close, which is exactly the
+	// symptom this fixed.
+	//
+	// `Stride` is the source bytes per texel: 4 for RGBA, 3 for tight RGB.
+	// Channels are written out in the platform's BGRA order.
+	UTexture2D* MakeMippedTexture(const uint8* Src, int32 N, int32 Stride, bool bSrgb)
 	{
-		if (!Pixels || N <= 0) return nullptr;
-		UTexture2D* Tex = UTexture2D::CreateTransient(N, N, PF_B8G8R8A8);
+		if (!Src || N <= 0 || (Stride != 3 && Stride != 4)) return nullptr;
+		const int32 NumMips = FMath::Max(1, (int32)FMath::FloorLog2((uint32)N) + 1);
+
+		UTexture2D* Tex = NewObject<UTexture2D>(GetTransientPackage(), NAME_None, RF_Transient);
 		if (!Tex) return nullptr;
+		Tex->SetPlatformData(new FTexturePlatformData());
+		Tex->GetPlatformData()->SizeX = N;
+		Tex->GetPlatformData()->SizeY = N;
+		Tex->GetPlatformData()->PixelFormat = PF_B8G8R8A8;
+		Tex->bNotOfflineProcessed = true;
 		Tex->SRGB = bSrgb;
 		Tex->CompressionSettings = bSrgb ? TC_Default : TC_VectorDisplacementmap;
 		Tex->AddressX = TA_Clamp;
 		Tex->AddressY = TA_Clamp;
 		Tex->Filter = TF_Trilinear;
-		if (uint8* P = (uint8*)Tex->GetPlatformData()->Mips[0].BulkData.Lock(LOCK_READ_WRITE))
+		Tex->NeverStream = true;
+
+		// Working copy in BGRA, halved as the chain goes down.
+		TArray<uint8> Cur;
+		Cur.SetNumUninitialized(N * N * 4);
+		for (int32 i = 0; i < N * N; i++)
 		{
-			// the bake is RGBA, the platform format is BGRA
+			Cur[i * 4 + 0] = Src[i * Stride + 2];
+			Cur[i * 4 + 1] = Src[i * Stride + 1];
+			Cur[i * 4 + 2] = Src[i * Stride + 0];
+			Cur[i * 4 + 3] = Stride == 4 ? Src[i * Stride + 3] : 255;
+		}
+
+		int32 Dim = N;
+		for (int32 m = 0; m < NumMips; m++)
+		{
+			FTexture2DMipMap* Mip = new FTexture2DMipMap(Dim, Dim, 1);
+			Tex->GetPlatformData()->Mips.Add(Mip);
+			Mip->BulkData.Lock(LOCK_READ_WRITE);
+			void* Out = Mip->BulkData.Realloc((int64)Dim * Dim * 4);
+			FMemory::Memcpy(Out, Cur.GetData(), (SIZE_T)Dim * Dim * 4);
+			Mip->BulkData.Unlock();
+
+			if (m + 1 < NumMips)
+			{
+				const int32 Half = FMath::Max(1, Dim / 2);
+				TArray<uint8> Next;
+				Next.SetNumUninitialized(Half * Half * 4);
+				for (int32 y = 0; y < Half; y++)
+				{
+					for (int32 x = 0; x < Half; x++)
+					{
+						const int32 x0 = FMath::Min(x * 2, Dim - 1);
+						const int32 x1 = FMath::Min(x * 2 + 1, Dim - 1);
+						const int32 y0 = FMath::Min(y * 2, Dim - 1);
+						const int32 y1 = FMath::Min(y * 2 + 1, Dim - 1);
+						for (int32 c = 0; c < 4; c++)
+						{
+							const int32 Sum =
+								Cur[(y0 * Dim + x0) * 4 + c] + Cur[(y0 * Dim + x1) * 4 + c] +
+								Cur[(y1 * Dim + x0) * 4 + c] + Cur[(y1 * Dim + x1) * 4 + c];
+							Next[(y * Half + x) * 4 + c] = (uint8)(Sum / 4);
+						}
+					}
+				}
+				Cur = MoveTemp(Next);
+				Dim = Half;
+			}
+		}
+
+		Tex->UpdateResource();
+		Tex->AddToRoot();
+		return Tex;
+	}
+
+	// One RGBA8 texture from a bake buffer.
+	UTexture2D* MakeBakeTexture(const uint8* Pixels, int32 N, bool bSrgb)
+	{
+		return MakeMippedTexture(Pixels, N, /*stride*/ 4, bSrgb);
+	}
+
+	// ---- the ground PER PIXEL ---------------------------------------------
+	//
+	// The bake above is one raster for the whole map. Over four kilometres
+	// that is two to four metres a texel, while the ground materials
+	// themselves repeat every one to seven metres - so every material is
+	// averaged away before the renderer ever sees it, and the ground reads as
+	// a low-resolution photograph of ground. That is the "low res image" the
+	// terrain has looked like.
+	//
+	// The fix is to stop baking the materials and bake only the MIXING
+	// WEIGHTS, which vary slowly and rasterise happily at a few metres. The
+	// sheets then get sampled per pixel at their own tiling, so all the detail
+	// arrives at full resolution.
+	//
+	// The bake is still built and still used: it is the correct FAR field.
+	// Past a hundred metres a screen pixel covers more than a coverage texel
+	// and the honest answer is the average, which is exactly what the bake
+	// holds - and it has a mip chain, which the coverage rasters cannot have
+	// (the mip of an index is not an index).
+	// Coverage and bake resolution are chosen PER MAP, not fixed.
+	//
+	// A constant 2048 means a 4 km map gets 2 metres a texel and an 8 km map
+	// gets 4, so the bigger maps were drawing at half the density for no
+	// reason other than the number being hard-coded. Both are sized to hold
+	// about two metres a texel and capped, because the cost is quadratic.
+	int32 GGroundTexelM = 2;         // metres per texel to aim for
+	int32 GGroundSizeMax = 4096;     // 4096^2 RGBA is 67 MB before mips
+	int32 GSheetSize    = 512;       // one array slice
+
+	// The near field runs much further than it did. It was 45 to 130 m, which
+	// is fine standing on the ground and useless in the air: fly at any
+	// height and every pixel on screen is past 130 m, so the whole world is
+	// the flattened bake and the detail never follows the camera. The sheet
+	// arrays are mipped, so running them out to several hundred metres costs
+	// bandwidth rather than correctness.
+	float GBlendNear    = 150.f;     // metres: all sheets
+	float GBlendFar     = 450.f;     // metres: all bake
+
+	int32 SizeForExtent(double ExtentM)
+	{
+		const int32 Want = (int32)FMath::RoundUpToPowerOfTwo(
+			(uint32)FMath::Max(1.0, ExtentM / FMath::Max(1, GGroundTexelM)));
+		return FMath::Clamp(Want, 2048, GGroundSizeMax);
+	}
+
+	UMaterial*       GGroundBlendParent = nullptr;
+	UTexture2D*      GCovIdxTex = nullptr;
+	UTexture2D*      GCovWTex   = nullptr;
+	UTexture2D*      GCovParamTex = nullptr;
+	UTexture2D*      GCovColourTex = nullptr;
+	UTexture2DArray* GSheetArray  = nullptr;
+	UTexture2DArray* GHeightArray = nullptr;
+
+	// An RGBA8 raster that must be read EXACTLY as authored: no sRGB curve, no
+	// filtering, no mips. A bilinear read of a layer index is a different
+	// layer, so this is the one texture in the material that must be point
+	// sampled.
+	UTexture2D* MakeRawTexture(const uint8* Px, int32 N, bool bPoint)
+	{
+		if (!Px || N <= 0) return nullptr;
+		UTexture2D* Tex = UTexture2D::CreateTransient(N, N, PF_B8G8R8A8);
+		if (!Tex) return nullptr;
+		Tex->SRGB = false;
+		Tex->CompressionSettings = TC_VectorDisplacementmap;   // uncompressed RGBA8
+		Tex->AddressX = TA_Clamp;
+		Tex->AddressY = TA_Clamp;
+		Tex->Filter = bPoint ? TF_Nearest : TF_Bilinear;
+		Tex->NeverStream = true;
+		if (uint8* D = (uint8*)Tex->GetPlatformData()->Mips[0].BulkData.Lock(LOCK_READ_WRITE))
+		{
 			for (int32 i = 0; i < N * N; i++)
 			{
-				P[i * 4 + 0] = Pixels[i * 4 + 2];
-				P[i * 4 + 1] = Pixels[i * 4 + 1];
-				P[i * 4 + 2] = Pixels[i * 4 + 0];
-				P[i * 4 + 3] = Pixels[i * 4 + 3];
+				D[i * 4 + 0] = Px[i * 4 + 2];
+				D[i * 4 + 1] = Px[i * 4 + 1];
+				D[i * 4 + 2] = Px[i * 4 + 0];
+				D[i * 4 + 3] = Px[i * 4 + 3];
 			}
 			Tex->GetPlatformData()->Mips[0].BulkData.Unlock();
 		}
@@ -1142,12 +1550,823 @@ namespace
 		return Tex;
 	}
 
+	// The aerial colour map arrives as tight RGB, three bytes a texel, because
+	// that is how it lies in the streaming tree. A texture wants four.
+	UTexture2D* MakeColourTexture(const uint8* Rgb, int32 N)
+	{
+		// NOT sRGB, and the old comment had it exactly backwards.
+		//
+		// The colour map ships _UNORM, so the game's shader reads the RAW
+		// BYTE, and the Overlay blend is authored against that byte. De-gamma
+		// on the way in turns Overlay's 0.500 identity into 0.216 and the
+		// ground comes out dark.
+		//
+		// Measured on MP_Isolated's land: a layer colour of (125.9, 119.3,
+		// 109.6) should composite to (135.0, 128.0, 117.7) and was producing
+		// (98.7, 93.4, 85.6). That is 27% darker on land and 62% darker over
+		// the reef. The control is libbf6's own bake of the same ground with
+		// the same colour map, which measures (136.1, 128.5, 117.8) - the
+		// predicted correct value to about one part in 255.
+		//
+		// The fallback three functions down already gets this right and says
+		// so ("0.5 LINEAR, not 0.5 sRGB"). The two paths were contradicting
+		// each other.
+		return MakeMippedTexture(Rgb, N, /*stride*/ 3, /*sRGB*/ false);
+	}
+
+	// The per-material constants as a lookup, four rows deep:
+	//
+	//   row 0  metres per repeat, rotation (radians), colour-map overlay, mask ramp exponent
+	//   row 1  tint rgb, height-blend strength
+	//   row 2  base height, displace range, coord scale xy
+	//   row 3  uv offset xy
+	//
+	// A texture rather than a set of shader parameters because the material
+	// must serve any map, and maps carry anywhere from a dozen to forty ground
+	// layers.
+	UTexture2D* MakeParamTexture(const TArray<BF6HP::FCore::FGroundMaterial>& Mats)
+	{
+		const int32 N = Mats.Num();
+		if (N <= 0) return nullptr;
+		UTexture2D* Tex = UTexture2D::CreateTransient(N, 4, PF_A32B32G32R32F);
+		if (!Tex) return nullptr;
+		Tex->SRGB = false;
+		Tex->CompressionSettings = TC_HDR;
+		Tex->AddressX = TA_Clamp;
+		Tex->AddressY = TA_Clamp;
+		Tex->Filter = TF_Nearest;
+		Tex->NeverStream = true;
+		if (float* D = (float*)Tex->GetPlatformData()->Mips[0].BulkData.Lock(LOCK_READ_WRITE))
+		{
+			for (int32 i = 0; i < N; i++)
+			{
+				D[i * 4 + 0] = FMath::Max(0.05f, Mats[i].MetresPerRepeat);
+				D[i * 4 + 1] = FMath::DegreesToRadians(Mats[i].RotationDeg);
+				D[i * 4 + 2] = FMath::Clamp(Mats[i].Overlay, 0.f, 1.f);
+				D[i * 4 + 3] = FMath::Max(0.01f, Mats[i].MaskRampExp);
+			}
+			float* R1 = D + N * 4;
+			for (int32 i = 0; i < N; i++)
+			{
+				R1[i * 4 + 0] = Mats[i].Tint.R;
+				R1[i * 4 + 1] = Mats[i].Tint.G;
+				R1[i * 4 + 2] = Mats[i].Tint.B;
+				R1[i * 4 + 3] = Mats[i].HeightBlend;
+			}
+			float* R2 = D + N * 8;
+			for (int32 i = 0; i < N; i++)
+			{
+				R2[i * 4 + 0] = Mats[i].BaseHeight;
+				R2[i * 4 + 1] = Mats[i].DisplaceRange;
+				R2[i * 4 + 2] = Mats[i].CoordScale.X;
+				R2[i * 4 + 3] = Mats[i].CoordScale.Y;
+			}
+			float* R3 = D + N * 12;
+			for (int32 i = 0; i < N; i++)
+			{
+				R3[i * 4 + 0] = Mats[i].UvOffset.X;
+				R3[i * 4 + 1] = Mats[i].UvOffset.Y;
+				R3[i * 4 + 2] = 0.f;
+				R3[i * 4 + 3] = 0.f;
+			}
+			Tex->GetPlatformData()->Mips[0].BulkData.Unlock();
+		}
+		Tex->UpdateResource();
+		Tex->AddToRoot();
+		return Tex;
+	}
+
+	// Every ground sheet as one array, WITH A MIP CHAIN.
+	//
+	// UTexture2DArray::CreateTransient allocates a single mip, which is fine
+	// for a full-screen blit and wrong for ground: a 512 sheet repeating every
+	// three metres puts eight texels under a screen pixel at a hundred metres,
+	// and with no mip to fall to that is a field of crawling static. The chain
+	// is built here by box-halving, which is what the sampler would have used.
+	UTexture2DArray* MakeSheetArray(const TArray<TArray<uint8>>& Sheets, int32 SheetSize)
+	{
+		const int32 N = Sheets.Num();
+		if (N <= 0 || SheetSize <= 0) return nullptr;
+		const int32 NumMips = FMath::Max(1, (int32)FMath::FloorLog2((uint32)SheetSize) + 1);
+
+		UTexture2DArray* Tex = NewObject<UTexture2DArray>(
+			GetTransientPackage(), NAME_None, RF_Transient);
+		if (!Tex) return nullptr;
+		Tex->SetPlatformData(new FTexturePlatformData());
+		Tex->GetPlatformData()->SizeX = SheetSize;
+		Tex->GetPlatformData()->SizeY = SheetSize;
+		Tex->GetPlatformData()->SetNumSlices(N);
+		Tex->GetPlatformData()->PixelFormat = PF_B8G8R8A8;
+		Tex->bNotOfflineProcessed = true;
+		Tex->SRGB = true;
+		Tex->CompressionSettings = TC_Default;
+		Tex->AddressX = TA_Wrap;
+		Tex->AddressY = TA_Wrap;
+		Tex->Filter = TF_Trilinear;
+		Tex->NeverStream = true;
+
+		// Working copy in BGRA, one buffer per slice, halved as the chain goes
+		// down. A sheet that failed to decode is left as flat mid grey rather
+		// than dropped: removing a slice would shift every index after it.
+		TArray<TArray<uint8>> Cur;
+		Cur.SetNum(N);
+		for (int32 s = 0; s < N; s++)
+		{
+			Cur[s].SetNumZeroed(SheetSize * SheetSize * 4);
+			if (Sheets[s].Num() >= SheetSize * SheetSize * 4)
+			{
+				const uint8* Src = Sheets[s].GetData();
+				uint8* Dst = Cur[s].GetData();
+				for (int32 i = 0; i < SheetSize * SheetSize; i++)
+				{
+					Dst[i * 4 + 0] = Src[i * 4 + 2];
+					Dst[i * 4 + 1] = Src[i * 4 + 1];
+					Dst[i * 4 + 2] = Src[i * 4 + 0];
+					Dst[i * 4 + 3] = Src[i * 4 + 3];
+				}
+			}
+			else
+			{
+				for (int32 i = 0; i < SheetSize * SheetSize; i++)
+				{
+					Cur[s][i * 4 + 0] = 128; Cur[s][i * 4 + 1] = 128;
+					Cur[s][i * 4 + 2] = 128; Cur[s][i * 4 + 3] = 255;
+				}
+			}
+		}
+
+		int32 Dim = SheetSize;
+		for (int32 m = 0; m < NumMips; m++)
+		{
+			FTexture2DMipMap* Mip = new FTexture2DMipMap(Dim, Dim, N);
+			Tex->GetPlatformData()->Mips.Add(Mip);
+			Mip->BulkData.Lock(LOCK_READ_WRITE);
+			uint8* Out = (uint8*)Mip->BulkData.Realloc((int64)Dim * Dim * 4 * N);
+			for (int32 s = 0; s < N; s++)
+			{
+				FMemory::Memcpy(Out + (int64)s * Dim * Dim * 4,
+				                Cur[s].GetData(), (SIZE_T)Dim * Dim * 4);
+			}
+			Mip->BulkData.Unlock();
+
+			if (m + 1 < NumMips)
+			{
+				const int32 Half = FMath::Max(1, Dim / 2);
+				for (int32 s = 0; s < N; s++)
+				{
+					TArray<uint8> Next;
+					Next.SetNumUninitialized(Half * Half * 4);
+					const uint8* Src = Cur[s].GetData();
+					for (int32 y = 0; y < Half; y++)
+					{
+						for (int32 x = 0; x < Half; x++)
+						{
+							const int32 x0 = FMath::Min(x * 2, Dim - 1);
+							const int32 x1 = FMath::Min(x * 2 + 1, Dim - 1);
+							const int32 y0 = FMath::Min(y * 2, Dim - 1);
+							const int32 y1 = FMath::Min(y * 2 + 1, Dim - 1);
+							for (int32 c = 0; c < 4; c++)
+							{
+								const int32 Sum =
+									Src[(y0 * Dim + x0) * 4 + c] + Src[(y0 * Dim + x1) * 4 + c] +
+									Src[(y1 * Dim + x0) * 4 + c] + Src[(y1 * Dim + x1) * 4 + c];
+								Next[(y * Half + x) * 4 + c] = (uint8)(Sum / 4);
+							}
+						}
+					}
+					Cur[s] = MoveTemp(Next);
+				}
+				Dim = Half;
+			}
+		}
+
+		Tex->UpdateResource();
+		Tex->AddToRoot();
+		return Tex;
+	}
+
+	// A one-texel array, so the PARENT material has an array to compile
+	// against.
+	//
+	// A texture object parameter is typed by whatever texture it holds when
+	// the material is translated, and the engine's stock default is a plain
+	// Texture2D. Leaving it there would declare the Custom node's input as
+	// Texture2D and then hand it to Texture2DArraySample, which does not
+	// compile - and the instance's real array arrives far too late to change
+	// that, because by then the parent is already built.
+	UTexture2DArray* GDefaultSheetArray = nullptr;
+	UTexture2DArray* DefaultSheetArray()
+	{
+		if (GDefaultSheetArray) return GDefaultSheetArray;
+		UTexture2DArray* T = UTexture2DArray::CreateTransient(4, 4, 1, PF_B8G8R8A8);
+		if (!T) return nullptr;
+		T->SRGB = true;
+		T->AddressX = TA_Wrap;
+		T->AddressY = TA_Wrap;
+		T->NeverStream = true;
+		if (uint8* D = (uint8*)T->GetPlatformData()->Mips[0].BulkData.Lock(LOCK_READ_WRITE))
+		{
+			FMemory::Memset(D, 128, 4 * 4 * 4);
+			T->GetPlatformData()->Mips[0].BulkData.Unlock();
+		}
+		T->UpdateResource();
+		T->AddToRoot();
+		GDefaultSheetArray = T;
+		return T;
+	}
+
+	// Mid grey, which is the Overlay identity: blend(base, 0.5) == base for
+	// every base. The right stand-in when a level ships no aerial map.
+	UTexture2D* GMidGrey = nullptr;
+	UTexture2D* MidGreyTexture()
+	{
+		if (GMidGrey) return GMidGrey;
+		UTexture2D* T = UTexture2D::CreateTransient(4, 4, PF_B8G8R8A8);
+		if (!T) return nullptr;
+		T->SRGB = false;         // 0.5 LINEAR, not 0.5 sRGB
+		T->CompressionSettings = TC_VectorDisplacementmap;
+		T->NeverStream = true;
+		if (uint8* D = (uint8*)T->GetPlatformData()->Mips[0].BulkData.Lock(LOCK_READ_WRITE))
+		{
+			FMemory::Memset(D, 128, 4 * 4 * 4);
+			T->GetPlatformData()->Mips[0].BulkData.Unlock();
+		}
+		T->UpdateResource();
+		T->AddToRoot();
+		GMidGrey = T;
+		return T;
+	}
+
+	UMaterial* EnsureGroundBlendMaterial()
+	{
+		if (GGroundBlendParent) return GGroundBlendParent;
+		UPackage* Pkg = CreatePackage(TEXT("/Temp/BF6HighPoly_GroundBlend"));
+		if (!Pkg) return nullptr;
+		Pkg->SetFlags(RF_Transient);
+		UMaterial* M = NewObject<UMaterial>(Pkg, TEXT("M_BF6HighPoly_GroundBlend"), RF_Transient);
+		M->MaterialDomain = MD_Surface;
+		M->SetShadingModel(MSM_DefaultLit);
+		M->BlendMode = BLEND_Opaque;
+		M->TwoSided = false;
+
+		auto Make = [&M](UClass* C, int32 X, int32 Y)
+		{ return UMaterialEditingLibrary::CreateMaterialExpression(M, C, X, Y); };
+
+		UMaterialExpressionWorldPosition* WP = Cast<UMaterialExpressionWorldPosition>(
+			Make(UMaterialExpressionWorldPosition::StaticClass(), -1100, 0));
+		UMaterialExpressionCameraPositionWS* CamP = Cast<UMaterialExpressionCameraPositionWS>(
+			Make(UMaterialExpressionCameraPositionWS::StaticClass(), -1100, 80));
+
+		auto Vec = [&](const TCHAR* Nm, FLinearColor Def, int32 Y)
+		{
+			UMaterialExpressionVectorParameter* V = Cast<UMaterialExpressionVectorParameter>(
+				Make(UMaterialExpressionVectorParameter::StaticClass(), -1100, Y));
+			if (V) { V->ParameterName = Nm; V->DefaultValue = Def; }
+			return V;
+		};
+		auto Scal = [&](const TCHAR* Nm, float Def, int32 Y)
+		{
+			UMaterialExpressionScalarParameter* S = Cast<UMaterialExpressionScalarParameter>(
+				Make(UMaterialExpressionScalarParameter::StaticClass(), -1100, Y));
+			if (S) { S->ParameterName = Nm; S->DefaultValue = Def; }
+			return S;
+		};
+		// The sampler type is not decoration. SAMPLERTYPE_Color says "this
+		// carries an sRGB image"; the coverage rasters and the parameter
+		// lookup carry indices, weights and metres, and saying otherwise
+		// invites a decode that would quietly change every number.
+		auto TexObj = [&](const TCHAR* Nm, UTexture* Def, EMaterialSamplerType S, int32 Y)
+		{
+			UMaterialExpressionTextureObjectParameter* T =
+				Cast<UMaterialExpressionTextureObjectParameter>(
+					Make(UMaterialExpressionTextureObjectParameter::StaticClass(), -1100, Y));
+			if (T)
+			{
+				T->ParameterName = Nm;
+				T->SamplerType = S;
+				if (Def) T->Texture = Def;
+			}
+			return T;
+		};
+
+		UMaterialExpressionVectorParameter* Lo = Vec(TEXT("GroundLo"), FLinearColor::Black, 160);
+		// The far window and the playable box, both in world XZ metres.
+		UMaterialExpressionVectorParameter* FarLoP =
+			Vec(TEXT("FarLo"), FLinearColor::Black, 1400);
+		UMaterialExpressionVectorParameter* FarSpanP =
+			Vec(TEXT("FarSpan"), FLinearColor(1, 1, 1, 1), 1460);
+		UMaterialExpressionVectorParameter* BoxCentreP =
+			Vec(TEXT("BoxCentre"), FLinearColor::Black, 1520);
+		UMaterialExpressionVectorParameter* BoxHalfP =
+			Vec(TEXT("BoxHalf"), FLinearColor(1, 1, 1, 1), 1580);
+		UMaterialExpressionVectorParameter* Span = Vec(TEXT("GroundSpan"), FLinearColor(1,1,1,1), 220);
+		UMaterialExpressionScalarParameter* CovN = Scal(TEXT("CoverageSize"), 2048.f, 280);
+		UMaterialExpressionScalarParameter* MatN = Scal(TEXT("MaterialCount"), 1.f, 340);
+		UMaterialExpressionScalarParameter* NearP = Scal(TEXT("BlendNear"), 45.f, 400);
+		UMaterialExpressionScalarParameter* FarP  = Scal(TEXT("BlendFar"), 130.f, 460);
+		// A DEBUG CHANNEL, so the ground can be interrogated by looking at it.
+		// Every mode below answers one question that is otherwise a guess.
+		UMaterialExpressionScalarParameter* Dbg = Scal(TEXT("DebugMode"), 0.f, 520);
+		// PHOTO BASE. How much of the ground's COLOUR comes from the level's own
+		// aerial map rather than from the layer sheets. See the shader.
+		UMaterialExpressionScalarParameter* Photo = Scal(TEXT("PhotoMix"), 0.f, 580);
+		// DEFAULT OFF. The aerial map is a correct photograph and a tempting
+		// crutch, but the goal is ground good enough to REPLACE it, and a
+		// crutch left in place is how that never happens. Kept as a live
+		// comparison via BF6.HighPoly.GroundPhoto, not as the answer.
+
+		UTexture2D* White = LoadObject<UTexture2D>(nullptr,
+			TEXT("/Engine/EngineResources/WhiteSquareTexture.WhiteSquareTexture"));
+		UMaterialExpressionTextureObjectParameter* CovIdx =
+			TexObj(TEXT("CovIdx"), White, SAMPLERTYPE_LinearColor, 520);
+		UMaterialExpressionTextureObjectParameter* CovW =
+			TexObj(TEXT("CovW"), White, SAMPLERTYPE_LinearColor, 580);
+		UMaterialExpressionTextureObjectParameter* ParamT =
+			TexObj(TEXT("CovParams"), White, SAMPLERTYPE_LinearColor, 640);
+		UMaterialExpressionTextureObjectParameter* Baked =
+			TexObj(TEXT("GroundAlbedo"), White, SAMPLERTYPE_Color, 700);
+		// The far bake: the whole footprint at low density, for the ground
+		// beyond the playable box. sRGB like the near bake it stands in for.
+		UMaterialExpressionTextureObjectParameter* FarBaked =
+			TexObj(TEXT("FarBake"), MidGreyTexture(), SAMPLERTYPE_Color, 1340);
+		UMaterialExpressionTextureObjectParameter* ColourM =
+			TexObj(TEXT("GroundColour"), White, SAMPLERTYPE_Color, 820);
+		UMaterialExpressionTextureObjectParameter* Sheets =
+			TexObj(TEXT("Sheets"), DefaultSheetArray(), SAMPLERTYPE_Color, 760);
+		// The normal/height sheets. Raw, not sRGB: the blue channel is a
+		// HEIGHT and putting a display curve through it changes the blend.
+		UMaterialExpressionTextureObjectParameter* Heights =
+			TexObj(TEXT("Heights"), DefaultSheetArray(), SAMPLERTYPE_LinearColor, 880);
+
+		UMaterialExpressionCustom* Blend = Cast<UMaterialExpressionCustom>(
+			Make(UMaterialExpressionCustom::StaticClass(), -500, 300));
+		if (!Blend || !WP || !CamP || !Lo || !Span || !CovN || !MatN || !NearP || !FarP
+			|| !CovIdx || !CovW || !ParamT || !Baked || !Sheets || !ColourM || !Heights
+			|| !FarBaked || !FarLoP || !FarSpanP || !BoxCentreP || !BoxHalfP
+			|| !Dbg || !Photo)
+		{
+			return nullptr;
+		}
+		if (!Sheets->Texture || !Sheets->Texture->IsA<UTexture2DArray>())
+		{
+			// Without an array here the Custom node's input translates as a
+			// Texture2D and the whole material fails to compile, which shows up
+			// as flat grey ground and a line in the log rather than anything
+			// pointing at this.
+			UE_LOG(LogBF6HighPoly, Warning,
+				TEXT("ground blend: no default texture array, so the material would not compile"));
+			return nullptr;
+		}
+
+		Blend->Description = TEXT("BF6 ground layer blend");
+		Blend->OutputType = CMOT_Float3;
+		Blend->Code = TEXT(R"HLSL(
+// Four coverage taps, bilinear over the WEIGHTS while the indices stay point
+// sampled. Sampling an index bilinearly gives a different index, so instead
+// the four neighbours are read whole and each one's weight for a reference
+// layer is accumulated by its bilinear share. Boundaries then fade over a
+// coverage texel instead of stepping.
+float2 pm  = WPos.xy * 0.01;
+float2 cuv = saturate((pm - Lo.xy) / max(Span.xy, 1.0));
+float2 tc  = cuv * CovSize - 0.5;
+float2 fr  = frac(tc);
+float  inv = 1.0 / CovSize;
+float2 b0  = (floor(tc) + 0.5) * inv;
+
+float4 IDS[4], WS[4];
+IDS[0] = Texture2DSampleLevel(CovIdx, CovIdxSampler, b0, 0) * 255.0;
+WS[0]  = Texture2DSampleLevel(CovW,   CovWSampler,   b0, 0);
+IDS[1] = Texture2DSampleLevel(CovIdx, CovIdxSampler, b0 + float2(inv, 0), 0) * 255.0;
+WS[1]  = Texture2DSampleLevel(CovW,   CovWSampler,   b0 + float2(inv, 0), 0);
+IDS[2] = Texture2DSampleLevel(CovIdx, CovIdxSampler, b0 + float2(0, inv), 0) * 255.0;
+WS[2]  = Texture2DSampleLevel(CovW,   CovWSampler,   b0 + float2(0, inv), 0);
+IDS[3] = Texture2DSampleLevel(CovIdx, CovIdxSampler, b0 + float2(inv, inv), 0) * 255.0;
+WS[3]  = Texture2DSampleLevel(CovW,   CovWSampler,   b0 + float2(inv, inv), 0);
+
+float BW[4];
+BW[0] = (1.0 - fr.x) * (1.0 - fr.y);
+BW[1] = fr.x * (1.0 - fr.y);
+BW[2] = (1.0 - fr.x) * fr.y;
+BW[3] = fr.x * fr.y;
+
+// The nearest corner supplies the four layers to blend. Anything a neighbour
+// carries that this one does not is genuinely a different material and gets
+// no weight here; it will own the pixel a texel further on.
+int   refc = (fr.x < 0.5 ? 0 : 1) + (fr.y < 0.5 ? 0 : 2);
+float rid[4] = { IDS[refc].x, IDS[refc].y, IDS[refc].z, IDS[refc].w };
+float acc[4] = { 0.0, 0.0, 0.0, 0.0 };
+
+for (int c = 0; c < 4; c++)
+{
+	float ic[4] = { IDS[c].x, IDS[c].y, IDS[c].z, IDS[c].w };
+	float wc[4] = { WS[c].x,  WS[c].y,  WS[c].z,  WS[c].w  };
+	for (int s = 0; s < 4; s++)
+	{
+		for (int k = 0; k < 4; k++)
+		{
+			if (wc[k] > 0.0 && abs(ic[k] - rid[s]) < 0.5)
+			{
+				acc[s] += BW[c] * wc[k];
+			}
+		}
+	}
+}
+
+// ASCENDING BY LAYER, because the evaluator's accumulators are order
+// dependent: each layer's coverage is measured against the composite of
+// everything below it, and the raster hands its slots back weight-sorted.
+for (int p = 1; p < 4; p++)
+{
+	for (int q = p; q > 0; q--)
+	{
+		if (rid[q] < rid[q - 1])
+		{
+			float tid = rid[q]; rid[q] = rid[q - 1]; rid[q - 1] = tid;
+			float tw2 = acc[q]; acc[q] = acc[q - 1]; acc[q - 1] = tw2;
+		}
+	}
+}
+
+// THE GAME'S OWN COVERAGE EVALUATOR, per pixel.
+//
+// What the raster carries is the raw MASK, not coverage. The difference is
+// not cosmetic: measured on MP_Dumbo the dominant layer holds only a third
+// of the mask, so normalising the four and blending gives every texel a
+// four-way average and no material ever reads - which is precisely the
+// "everything is mush" look. The kernel turns mask into coverage using each
+// layer's HEIGHT, so a gravel with tall stones punches through a sand that
+// sits low instead of cross-fading with it.
+//
+//   coverage = saturate(mask + (hiRef - loRef) * heightBlend)
+//
+// with both height references pulled toward the running composite by
+// pow(maskRamp, rampExp), and mask >= 1 or <= 0 short-circuiting.
+// Transcribed from the DXIL disassembly of the terrain evaluator kernels.
+float3 col = float3(0.0, 0.0, 0.0);
+float  du  = 1.0 / max(MatCount, 1.0);
+// One tap, shared by every layer: the aerial map is a property of the PLACE,
+// not of the material sitting on it.
+float3 aerial = Texture2DSample(Aerial, AerialSampler, cuv).rgb;
+
+// WORLD derivatives, taken ONCE and out here where they are continuous.
+//
+// The sheet UV depends on which layer this pixel drew, through that layer's
+// repeat length. Across a boundary between two materials with different repeat
+// lengths the UV jumps, so an implicitly-differentiated sample sees an enormous
+// derivative, drops to the coarsest mip, and paints a blurred stripe along
+// every layer transition on the map. World position does not jump, so the
+// honest derivative is this one pushed through the same transform the UV took.
+float2 dpx = ddx(pm);
+float2 dpy = ddy(pm);
+
+float accH = 0.0, accLoMax = 0.0, accHiMax = 0.0;
+bool  touched = false;
+
+for (int s2 = 0; s2 < 4; s2++)
+{
+	float slice = clamp(rid[s2], 0.0, max(MatCount - 1.0, 0.0));
+	float2 pu = float2((slice + 0.5) * du, 0.0);
+	float4 P0 = Texture2DSampleLevel(Params, ParamsSampler, float2(pu.x, 0.125), 0);
+	float4 P1 = Texture2DSampleLevel(Params, ParamsSampler, float2(pu.x, 0.375), 0);
+	float4 P2 = Texture2DSampleLevel(Params, ParamsSampler, float2(pu.x, 0.625), 0);
+	float4 P3 = Texture2DSampleLevel(Params, ParamsSampler, float2(pu.x, 0.875), 0);
+
+	// UV: world metres over the layer's own repeat, its coordinate scale, its
+	// offset, then its rotation. This is the thing that makes ground read as
+	// ground rather than as a photograph of ground.
+	float  rep = max(P0.r, 0.05);
+	float2 uv  = (pm / rep) * P2.zw + P3.xy;
+	float2 ddu = (dpx / rep) * P2.zw;
+	float2 ddv = (dpy / rep) * P2.zw;
+	float  rot = P0.g;
+	if (abs(rot) > 0.001)
+	{
+		float cs = cos(rot), sn = sin(rot);
+		uv  = float2(uv.x  * cs - uv.y  * sn, uv.x  * sn + uv.y  * cs);
+		ddu = float2(ddu.x * cs - ddu.y * sn, ddu.x * sn + ddu.y * cs);
+		ddv = float2(ddv.x * cs - ddv.y * sn, ddv.x * sn + ddv.y * cs);
+	}
+
+	float4 sh4 = Texture2DArraySampleGrad(Sheets, SheetsSampler,
+	                                      float3(uv, slice), ddu, ddv);
+	float4 nh4 = Texture2DArraySampleGrad(Heights, HeightsSampler,
+	                                      float3(uv, slice), ddu, ddv);
+
+	// The layer's own height, and the range it can move within.
+	float ht      = saturate(nh4.b);
+	float baseH   = P2.r;
+	float disp    = P2.g;
+	float hLayer  = baseH + (ht - 0.5) * disp;
+	float hMax    = baseH + 0.5 * disp;
+	float hMin    = baseH - 0.5 * disp;
+
+	float m       = saturate(acc[s2]);
+	float rampExp = max(P0.a, 0.01);
+	float hb      = P1.a;
+	float wHi     = pow(saturate((m - 0.9) / -0.85), rampExp);
+	float wLo     = pow(saturate((m - 0.05) / 0.95), rampExp);
+	float hiRef   = hLayer + (accHiMax - hMax) * wHi;
+	float loRef   = accH + (hMin - accLoMax) * wLo;
+	float rawc    = m + (hiRef - loRef) * hb;
+	float c = (m >= 1.0) ? 1.0 : ((m <= 0.0) ? 0.0 : saturate(rawc));
+
+	float3 lc = sh4.rgb * P1.rgb;
+
+	// The colour map Overlay, per layer and at its own authored strength.
+	// This is what puts a map's real palette on stock ground materials: the
+	// sheets are shot in a studio, and a map that skips this reads grey or
+	// plainly the wrong colour for where it is.
+	if (P0.b > 0.001)
+	{
+		// Overlay, branch-free and PER COMPONENT.
+		//
+		// The obvious spelling of this is a ternary on `lc < 0.5`, and it does
+		// not compile: on a float3 that comparison is a bool3, and HLSL 2021 -
+		// which is what SM6 goes through - refuses a non-scalar ternary
+		// condition. It builds fine on the older path, so the failure lands on
+		// one Nanite/Lumen permutation and the whole material silently falls
+		// back to the default grey. step() sidesteps the whole question.
+		float3 loB = 2.0 * lc * aerial;
+		float3 hiB = 1.0 - 2.0 * (1.0 - lc) * (1.0 - aerial);
+		float3 useLo = step(lc, 0.5);        // 1 where lc <= 0.5
+		lc = lerp(lc, lerp(hiB, loB, useLo), P0.b);
+	}
+
+	// The first layer to reach a texel is promoted to full coverage for the
+	// COLOUR lerp only, so a texel is never left showing the initial value;
+	// the height chain below still uses the honest coverage.
+	float cc = (!touched && c > 0.0) ? 1.0 : c;
+	col = lerp(col, lc, cc);
+
+	if (c > 0.0)
+	{
+		accH     = clamp(lerp(loRef, hiRef, rawc), -1.0, 10.0);
+		accLoMax = lerp(accLoMax, hMin, rawc);
+		accHiMax = lerp(accHiMax, hMax, rawc);
+		touched  = true;
+	}
+}
+
+// Nothing resolved here: the aerial photograph of this spot is by far the
+// closest answer available, and it is real shipped data rather than a guess.
+// LINEARISED HERE, because this is the one place the map is used as a
+// COLOUR rather than as the Overlay's operand. The texture is raw now, so
+// anything consuming it as light has to de-gamma explicitly.
+if (!touched) col = pow(max(aerial, 0.0), 2.2);
+
+// COLOUR FROM THE PHOTOGRAPH, DETAIL FROM THE MATERIALS.
+//
+// Assembling ground colour out of layer sheets depends on picking the right
+// sheet for every layer, and where that join is wrong the ground is wrong in a
+// way no amount of blending fixes. The level's own aerial colour map does not
+// have that problem: it is a photograph of this exact ground, correct by
+// construction, and merely low frequency - now 0.62 m a texel over the
+// playable box rather than the 2 m it was over the whole footprint.
+//
+// So the two are used for what each is good at. The photograph carries the
+// COLOUR, which is what the eye judges a map by, and the sheets carry the
+// high-frequency STRUCTURE as a brightness modulation around their own mean.
+// A wrong sheet then costs detail rather than hue, which is a far smaller
+// error than the one it replaces.
+//
+// This is not a departure from the game either: the shipped evaluator already
+// Overlay-blends this same map over the layer colours. It is the same two
+// inputs with the emphasis where the data is trustworthy.
+{
+    float sheetLuma = dot(col, float3(0.2126, 0.7152, 0.0722));
+    // Around a mid reference rather than a measured mean: the sheets are
+    // authored near mid grey and a per-pixel mean is not available here.
+    float detail = clamp(sheetLuma / 0.35, 0.55, 1.7);
+    // Same reason as the untouched case above: as a colour, not an operand.
+    float3 photo = pow(max(aerial, 0.0), 2.2) * detail;
+    col = lerp(col, photo, saturate(PhotoMix));
+}
+
+float dist = length(WPos - CamPos) * 0.01;
+float k = saturate((dist - NearM) / max(FarM - NearM, 1.0));
+float3 baked = Texture2DSample(Bake, BakeSampler, cuv).rgb;
+
+// OUTSIDE THE PLAYABLE BOX THERE IS NO COVERAGE AND NO NEAR BAKE.
+//
+// Both are rasterised over the box, so a texel beyond it samples outside
+// 0..1 and clamps to whatever sits on the border - which on an 8 km map
+// with a 2.5 km box is about 90% of the ground by area, smeared.
+//
+// The far bake covers the whole footprint, so past the box edge the colour
+// comes from there instead. Crossed over by POSITION rather than by camera
+// distance, because the boundary is a property of the ground, not of where
+// anyone is standing. The 8% band inside the edge keeps the join from
+// reading as a straight line.
+// .xy ON EVERY VECTOR PARAMETER. They arrive as float3, and float2 minus
+// float3 is a dimension mismatch that fails the whole material - the same
+// way an out-of-bounds swizzle did. `pm` is the world XZ in metres, already
+// computed above, so it is reused rather than recomputed.
+float2 bx = abs((pm - BoxCentre.xy) / max(BoxHalf.xy, 1.0));
+float outside = saturate((max(bx.x, bx.y) - 0.92) / 0.08);
+if (outside > 0.0)
+{
+    float2 fuv = saturate((pm - FarLo.xy) / max(FarSpan.xy, 1.0));
+    float3 farCol = Texture2DSample(FarBake, FarBakeSampler, fuv).rgb;
+    col   = lerp(col, farCol, outside);
+    baked = lerp(baked, farCol, outside);
+}
+
+// DEBUG CHANNELS. Each isolates one suspect, so a look answers a question
+// instead of starting an argument:
+//   1  flat colour per DOMINANT LAYER - if the pattern follows these blocks
+//      the fault is the coverage or the join, and if it does not it is a
+//      sheet's own content
+//   2  the aerial colour map alone - is the smear the photograph?
+//   3  the near-field blend alone, no far bake
+//   4  the far bake alone, no per-pixel blend
+//   5  the layer COUNT per texel, so mush is visible as brightness
+int dbg = (int)(DebugMode + 0.5);
+// 100 + N isolates layer N: it draws white where that material won the texel
+// and near black everywhere else, so a wrong sheet can be pinned to a layer
+// INDEX by looking rather than by reasoning about the join.
+if (dbg >= 100)
+{
+    float want = (float)(dbg - 100);
+    return abs(rid[0] - want) < 0.5 ? float3(1.0, 1.0, 1.0) : float3(0.02, 0.02, 0.02);
+}
+if (dbg == 1)
+{
+    float h = frac(rid[0] * 0.6180339887);
+    return saturate(float3(abs(h * 6.0 - 3.0) - 1.0,
+                           2.0 - abs(h * 6.0 - 2.0),
+                           2.0 - abs(h * 6.0 - 4.0)));
+}
+if (dbg == 2) return aerial;
+if (dbg == 3) return col;
+if (dbg == 4) return baked;
+if (dbg == 5)
+{
+    float used = 0.0;
+    for (int d = 0; d < 4; d++) if (acc[d] > 0.0) used += 1.0;
+    return float3(used * 0.25, used * 0.25, used * 0.25);
+}
+return lerp(col, baked, k);
+)HLSL");
+
+		Blend->Inputs.Empty();
+		auto In = [&Blend](const TCHAR* Nm, UMaterialExpression* E)
+		{ FCustomInput I; I.InputName = Nm; I.Input.Expression = E; Blend->Inputs.Add(I); };
+		In(TEXT("WPos"), WP);
+		In(TEXT("CamPos"), CamP);
+		In(TEXT("Lo"), Lo);
+		In(TEXT("Span"), Span);
+		In(TEXT("CovSize"), CovN);
+		In(TEXT("MatCount"), MatN);
+		In(TEXT("NearM"), NearP);
+		In(TEXT("FarM"), FarP);
+		In(TEXT("CovIdx"), CovIdx);
+		In(TEXT("CovW"), CovW);
+		In(TEXT("Params"), ParamT);
+		In(TEXT("Sheets"), Sheets);
+		In(TEXT("Bake"), Baked);
+		In(TEXT("FarBake"), FarBaked);
+		In(TEXT("FarLo"), FarLoP);
+		In(TEXT("FarSpan"), FarSpanP);
+		In(TEXT("BoxCentre"), BoxCentreP);
+		In(TEXT("BoxHalf"), BoxHalfP);
+		In(TEXT("Aerial"), ColourM);
+		In(TEXT("DebugMode"), Dbg);
+		In(TEXT("PhotoMix"), Photo);
+		In(TEXT("Heights"), Heights);
+
+		UMaterialEditingLibrary::ConnectMaterialProperty(Blend, TEXT(""), MP_BaseColor);
+
+		UMaterialExpressionScalarParameter* Rg = Scal(TEXT("GroundRoughness"), 0.9f, 900);
+		if (Rg) UMaterialEditingLibrary::ConnectMaterialProperty(Rg, TEXT(""), MP_Roughness);
+
+		M->PreEditChange(nullptr);
+		M->PostEditChange();
+		M->AddToRoot();   // see EnsureGroundMaterial: a raw global must be rooted
+		GGroundBlendParent = M;
+		return M;
+	}
+
+	// The per-pixel ground, or null to fall back on the flattened bake.
+	UMaterialInstanceDynamic* MakeGroundBlendMaterial(UObject* Outer, const FString& Level,
+	                                                  double ExtentM)
+	{
+		BF6HP::FCore::FGroundCoverage C;
+		const double T0 = FPlatformTime::Seconds();
+		if (!GCore.GroundCoverage(Level, SizeForExtent(ExtentM), C))
+		{
+			UE_LOG(LogBF6HighPoly, Warning, TEXT("ground coverage: %s"), *GCore.Error);
+			return nullptr;
+		}
+
+		// Decode every bound sheet to one size so they can share an array.
+		// The height sheets go into a second array of the same shape: the
+		// evaluator needs a height per layer at the same point, and without it
+		// the blend has nothing to sharpen with.
+		TArray<TArray<uint8>> Sheets, Heights;
+		Sheets.SetNum(C.Materials.Num());
+		Heights.SetNum(C.Materials.Num());
+		int32 Decoded = 0, HeightsDecoded = 0;
+		for (int32 i = 0; i < C.Materials.Num(); i++)
+		{
+			if (!C.Materials[i].Albedo.IsEmpty())
+			{
+				if (GCore.LayerSheet(C.Materials[i].Albedo, GSheetSize, Sheets[i])) Decoded++;
+				else Sheets[i].Reset();
+			}
+			if (!C.Materials[i].Normal.IsEmpty())
+			{
+				if (GCore.LayerSheet(C.Materials[i].Normal, GSheetSize, Heights[i])) HeightsDecoded++;
+				else Heights[i].Reset();
+			}
+		}
+		UE_LOG(LogBF6HighPoly, Log,
+			TEXT("ground coverage: %d px over %.0f m (%.2f m/texel), %d material(s), ")
+			TEXT("%d albedo + %d height sheet(s) decoded, %.1f%% empty, %.1fs"),
+			C.Size, C.Hi.X - C.Lo.X, (float)(C.Hi.X - C.Lo.X) / (float)FMath::Max(1, C.Size),
+			C.Materials.Num(), Decoded, HeightsDecoded, C.EmptyFraction * 100.f,
+			FPlatformTime::Seconds() - T0);
+		if (Decoded == 0)
+		{
+			UE_LOG(LogBF6HighPoly, Warning,
+				TEXT("no ground sheet decoded, so the per-pixel blend would draw flat; ")
+				TEXT("falling back to the bake"));
+			return nullptr;
+		}
+
+		GCovIdxTex = MakeRawTexture(C.Idx, C.Size, /*point*/ true);
+		GCovWTex = MakeRawTexture(C.Weight, C.Size, /*point*/ true);
+		GCovParamTex = MakeParamTexture(C.Materials);
+		GCovColourTex = C.Colour ? MakeColourTexture(C.Colour, C.Size) : nullptr;
+		GSheetArray = MakeSheetArray(Sheets, GSheetSize);
+		GHeightArray = MakeSheetArray(Heights, GSheetSize);
+		if (!GCovIdxTex || !GCovWTex || !GCovParamTex || !GSheetArray || !GHeightArray)
+		{
+			UE_LOG(LogBF6HighPoly, Warning, TEXT("ground blend: a texture would not build"));
+			return nullptr;
+		}
+
+		UMaterial* Parent = EnsureGroundBlendMaterial();
+		if (!Parent) return nullptr;
+		UMaterialInstanceDynamic* MID = UMaterialInstanceDynamic::Create(Parent, Outer);
+		if (!MID) return nullptr;
+		MID->SetFlags(RF_Transient);
+		MID->SetTextureParameterValue(TEXT("CovIdx"), GCovIdxTex);
+		MID->SetTextureParameterValue(TEXT("CovW"), GCovWTex);
+		MID->SetTextureParameterValue(TEXT("CovParams"), GCovParamTex);
+		if (GCovColourTex)
+		{
+			MID->SetTextureParameterValue(TEXT("GroundColour"), GCovColourTex);
+		}
+		else
+		{
+			// White is the Overlay identity only where the layer colour is
+			// already 1, so a missing map has to switch the blend OFF rather
+			// than feed it a neutral - which the strength in the parameter
+			// lookup cannot do from here. Mid grey IS the identity: Overlay
+			// with 0.5 returns the base unchanged.
+			MID->SetTextureParameterValue(TEXT("GroundColour"), MidGreyTexture());
+		}
+		MID->SetTextureParameterValue(TEXT("Sheets"), GSheetArray);
+		MID->SetTextureParameterValue(TEXT("Heights"), GHeightArray);
+		if (GGroundAlbedo) MID->SetTextureParameterValue(TEXT("GroundAlbedo"), GGroundAlbedo);
+		// THE FAR FIELD. Bound only when it baked: with no far texture the
+		// crossover still runs, so the fallback must be the near bake rather
+		// than mid grey, and binding GroundAlbedo here makes the lerp a no-op.
+		MID->SetTextureParameterValue(TEXT("FarBake"),
+			GGroundFar ? GGroundFar : GGroundAlbedo);
+		MID->SetVectorParameterValue(TEXT("FarLo"),
+			FLinearColor((float)GFarLo.X, (float)GFarLo.Y, 0, 0));
+		MID->SetVectorParameterValue(TEXT("FarSpan"),
+			FLinearColor((float)GFarSpan.X, (float)GFarSpan.Y, 1, 1));
+		// With no far bake the box is reported as enormous, which drives
+		// `outside` to zero everywhere and leaves the old behaviour intact.
+		const bool bHaveFar = GGroundFar != nullptr;
+		MID->SetVectorParameterValue(TEXT("BoxCentre"),
+			FLinearColor((float)GBoxCentre.X, (float)GBoxCentre.Y, 0, 0));
+		MID->SetVectorParameterValue(TEXT("BoxHalf"),
+			bHaveFar ? FLinearColor((float)GBoxHalf.X, (float)GBoxHalf.Y, 1, 1)
+			         : FLinearColor(1e9f, 1e9f, 1, 1));
+		MID->SetVectorParameterValue(TEXT("GroundLo"),
+			FLinearColor((float)C.Lo.X, (float)C.Lo.Y, 0, 0));
+		MID->SetVectorParameterValue(TEXT("GroundSpan"),
+			FLinearColor(FMath::Max(1.f, (float)(C.Hi.X - C.Lo.X)),
+			             FMath::Max(1.f, (float)(C.Hi.Y - C.Lo.Y)), 1, 1));
+		MID->SetScalarParameterValue(TEXT("CoverageSize"), (float)C.Size);
+		MID->SetScalarParameterValue(TEXT("MaterialCount"), (float)C.Materials.Num());
+		MID->SetScalarParameterValue(TEXT("BlendNear"), GBlendNear);
+		MID->SetScalarParameterValue(TEXT("BlendFar"), GBlendFar);
+		return MID;
+	}
+
 	// Bake the ground and hand back a material instance for the terrain tiles.
 	// Null when there is nothing to bake, which leaves the terrain as it was.
-	UMaterialInstanceDynamic* MakeGroundMaterial(UObject* Outer, const FString& Level)
+	UMaterialInstanceDynamic* MakeGroundMaterial(UObject* Outer, const FString& Level,
+	                                             double ExtentM,
+	                                             const FVector2D& FarLo, float FarSize)
 	{
 		BF6HP::FCore::FGroundBake B;
 		const double T0 = FPlatformTime::Seconds();
+		GGroundBakeSize = SizeForExtent(ExtentM);
 		if (!GCore.BakeGround(Level, FVector2D::ZeroVector, 0.f, GGroundBakeSize, B))
 		{
 			UE_LOG(LogBF6HighPoly, Warning, TEXT("ground bake: %s"), *GCore.Error);
@@ -1161,6 +2380,47 @@ namespace
 
 		GGroundAlbedo = MakeBakeTexture(B.Albedo, B.Size, /*sRGB*/ true);
 		GGroundNormal = MakeBakeTexture(B.Normal, B.Size, /*sRGB*/ false);
+		// Remember the near window: it is the box, and the shader crosses over
+		// at its edge.
+		GBoxCentre = FVector2D((B.Lo.X + B.Hi.X) * 0.5, (B.Lo.Y + B.Hi.Y) * 0.5);
+		GBoxHalf   = FVector2D(FMath::Max(1.0, (B.Hi.X - B.Lo.X) * 0.5),
+		                       FMath::Max(1.0, (B.Hi.Y - B.Lo.Y) * 0.5));
+
+		// THE FAR BAKE, over the whole footprint. An explicit rect overrides
+		// the playable-box default inside the core, which is the only reason
+		// this needs no change down there.
+		if (FarSize > 1.f)
+		{
+			BF6HP::FCore::FGroundBake F;
+			const double TF = FPlatformTime::Seconds();
+			if (GCore.BakeGround(Level, FarLo, FarSize, 1024, F))
+			{
+				GGroundFar = MakeBakeTexture(F.Albedo, F.Size, /*sRGB*/ true);
+				GFarLo   = FVector2D(F.Lo.X, F.Lo.Y);
+				GFarSpan = FVector2D(FMath::Max(1.0, F.Hi.X - F.Lo.X),
+				                     FMath::Max(1.0, F.Hi.Y - F.Lo.Y));
+				UE_LOG(LogBF6HighPoly, Log,
+					TEXT("ground far: %d px over %.0f m (%.2f m/texel), %.1fs - the ")
+					TEXT("terrain outside the %.0f m playable box was sampling a ")
+					TEXT("clamped border texel"),
+					F.Size, F.Hi.X - F.Lo.X, F.MetresPerTexel,
+					FPlatformTime::Seconds() - TF, GBoxHalf.X * 2.0);
+			}
+			else
+			{
+				UE_LOG(LogBF6HighPoly, Warning,
+					TEXT("ground far: %s - terrain beyond the playable box will ")
+					TEXT("keep smearing its border texel"), *GCore.Error);
+			}
+		}
+		// THE PER-PIXEL PATH FIRST. It needs the bake anyway - that is its far
+		// field - so this runs after the bake and falls back to it whole if the
+		// coverage or the sheets do not come out.
+		if (UMaterialInstanceDynamic* Blend = MakeGroundBlendMaterial(Outer, Level, ExtentM))
+		{
+			return Blend;
+		}
+
 		UMaterial* Parent = EnsureGroundMaterial();
 		if (!Parent || !GGroundAlbedo) return nullptr;
 		UMaterialInstanceDynamic* MID = UMaterialInstanceDynamic::Create(Parent, Outer);
@@ -1185,7 +2445,14 @@ namespace
 		if (T.Size <= 1) return 0;
 
 		// Bake the ground once for the whole map, before any tile is made.
-		GroundMat = MakeGroundMaterial(A, BF6Ext::CurrentLevel());
+		// The map's own footprint decides how dense the ground needs to be.
+		// The FULL footprint goes in as the far window, because that is what
+		// the mesh below actually covers.
+		GroundMat = MakeGroundMaterial(A, BF6Ext::CurrentLevel(),
+			FMath::Max(T.WorldMax.X - T.WorldMin.X, T.WorldMax.Z - T.WorldMin.Z),
+			FVector2D(T.WorldMin.X, T.WorldMin.Z),
+			(float)FMath::Max(T.WorldMax.X - T.WorldMin.X,
+			                  T.WorldMax.Z - T.WorldMin.Z));
 
 		const int32 N = FMath::Min(GTerrainSide, T.Size);
 		const int32 Step = FMath::Max(1, (T.Size - 1) / (N - 1));
@@ -1314,6 +2581,8 @@ namespace
 	// two are not the same surface, and the difference is the whole difficulty.
 	float GRoadLift = 6.f;             // centimetres above the ground
 	int32 GRoadRecords = 0, GRoadTris = 0, GRoadElevated = 0;
+	int32 GRoadColourless = 0;   // records that bind no colour sheet at all
+	int32 GRoadPainted = 0;      // ...of which carry an authored colour instead
 
 	// THE UV ORDER IS THE ONE OPEN QUESTION HERE, and it cannot be settled by
 	// arithmetic. The edge metric that validates the SCALE is symmetric in its
@@ -1346,6 +2615,158 @@ namespace
 		     + H(x0, z1) * (1 - tx) * tz       + H(x1, z1) * tx * tz;
 	}
 
+	// WHAT A MATERIAL ACTUALLY IS, once the editor has finished with it.
+	//
+	// A material can be built, report no compile errors, and still not be the
+	// thing that was asked for: a shading model can fail to stick, a blend mode
+	// can be overridden, and a custom output can sit in the graph with nothing
+	// connected to it. All three look identical from the outside - a surface that
+	// draws, wrongly - and all three are cheap to state outright.
+	static const TCHAR* BF6_ShadingModelName(EMaterialShadingModel S)
+	{
+	    switch (S)
+	    {
+	    case MSM_Unlit:            return TEXT("unlit");
+	    case MSM_DefaultLit:       return TEXT("default lit");
+	    case MSM_Subsurface:       return TEXT("subsurface");
+	    case MSM_PreintegratedSkin:return TEXT("preintegrated skin");
+	    case MSM_ClearCoat:        return TEXT("clear coat");
+	    case MSM_SubsurfaceProfile:return TEXT("subsurface profile");
+	    case MSM_TwoSidedFoliage:  return TEXT("two sided foliage");
+	    case MSM_Hair:             return TEXT("hair");
+	    case MSM_Cloth:            return TEXT("cloth");
+	    case MSM_Eye:              return TEXT("eye");
+	    case MSM_SingleLayerWater: return TEXT("single layer water");
+	    case MSM_ThinTranslucent:  return TEXT("thin translucent");
+	    default:                   return TEXT("other");
+	    }
+	}
+
+	static const TCHAR* BF6_BlendModeName(EBlendMode B)
+	{
+	    switch (B)
+	    {
+	    case BLEND_Opaque:         return TEXT("opaque");
+	    case BLEND_Masked:         return TEXT("masked");
+	    case BLEND_Translucent:    return TEXT("translucent");
+	    case BLEND_Additive:       return TEXT("additive");
+	    case BLEND_Modulate:       return TEXT("modulate");
+	    case BLEND_AlphaComposite: return TEXT("alpha composite");
+	    case BLEND_AlphaHoldout:   return TEXT("alpha holdout");
+	    // Substrate only, and it is what a translucent material becomes once
+	    // the legacy conversion has run - so this is the NORMAL answer for
+	    // glass on this project, not an oddity.
+	    case BLEND_TranslucentColoredTransmittance:
+	                               return TEXT("translucent, coloured transmittance");
+	    default:                   return TEXT("other");
+	    }
+	}
+
+	// Every CUSTOM OUTPUT in the graph, and which of its pins are actually wired.
+	//
+	// An unconnected pin on a custom output does not error. It compiles to that
+	// output's DEFAULT, and the material then behaves in a way the graph does not
+	// show. Single Layer Water is the case in hand: it has four pins and we
+	// connect two, so the other two are running on defaults nobody has stated.
+	static void BF6_ReportCustomOutputs(const TCHAR* Name, UMaterial* M)
+	{
+	    if (!M) return;
+	    for (UMaterialExpression* E : M->GetExpressionCollection().Expressions)
+	    {
+	        UMaterialExpressionCustomOutput* CO = Cast<UMaterialExpressionCustomOutput>(E);
+	        if (!CO) continue;
+	        FString Wired, Bare;
+	        const int32 N = CO->CountInputs();
+	        for (int32 i = 0; i < N; i++)
+	        {
+	            const FExpressionInput* In = CO->GetInput(i);
+	            const FString Pin = CO->GetInputName(i).ToString();
+	            FString& Bucket = (In && In->Expression) ? Wired : Bare;
+	            if (!Bucket.IsEmpty()) Bucket += TEXT(", ");
+	            Bucket += Pin;
+	        }
+	        UE_LOG(LogBF6HighPoly, Display,
+	            TEXT("CHECK %s: custom output %s - connected [%s], on defaults [%s]"),
+	            Name, *CO->GetClass()->GetName(),
+	            Wired.IsEmpty() ? TEXT("none") : *Wired,
+	            Bare.IsEmpty() ? TEXT("none") : *Bare);
+	    }
+	}
+
+	// What a material BECAME, in one line plus its custom outputs.
+	// THE ROOT NODE'S OWN PINS.
+	//
+	// BF6_ReportCustomOutputs covers the custom output nodes; this covers the
+	// material INPUTS, which is where the water bug actually was. The Single
+	// Layer Water custom output was correctly wired the whole time. The pin
+	// that was wrong was Opacity, on the root, and nothing reported it.
+	//
+	// Caveat under Substrate: the legacy conversion MOVES most connections
+	// onto its own convert node, so BaseColor and friends read as unconnected
+	// after PostEditChange. Opacity is COPIED rather than moved
+	// (Material.cpp:3977), so it still reads correctly here, which is the one
+	// this check exists for.
+	static void BF6_ReportRootInputs(const TCHAR* Name, UMaterial* M)
+	{
+	    if (!M) return;
+	    struct FPin { EMaterialProperty P; const TCHAR* N; };
+	    static const FPin Pins[] = {
+	        { MP_BaseColor,           TEXT("BaseColor") },
+	        { MP_Metallic,            TEXT("Metallic") },
+	        { MP_Specular,            TEXT("Specular") },
+	        { MP_Roughness,           TEXT("Roughness") },
+	        { MP_EmissiveColor,       TEXT("Emissive") },
+	        { MP_Opacity,             TEXT("Opacity") },
+	        { MP_OpacityMask,         TEXT("OpacityMask") },
+	        { MP_Normal,              TEXT("Normal") },
+	        { MP_WorldPositionOffset, TEXT("WorldPositionOffset") },
+	    };
+	    FString Wired, Bare;
+	    for (const FPin& Pin : Pins)
+	    {
+	        const FExpressionInput* In = M->GetExpressionInputForProperty(Pin.P);
+	        FString& Bucket = (In && In->Expression) ? Wired : Bare;
+	        if (!Bucket.IsEmpty()) Bucket += TEXT(", ");
+	        Bucket += Pin.N;
+	    }
+	    UE_LOG(LogBF6HighPoly, Display,
+	        TEXT("%s: root inputs - connected [%s], on defaults [%s]"),
+	        Name, Wired.IsEmpty() ? TEXT("none") : *Wired,
+	        Bare.IsEmpty() ? TEXT("none") : *Bare);
+
+	    const FExpressionInput* Op = M->GetExpressionInputForProperty(MP_Opacity);
+	    if (M->GetShadingModels().HasShadingModel(MSM_SingleLayerWater) &&
+	        (!Op || !Op->Expression))
+	    {
+	        UE_LOG(LogBF6HighPoly, Error,
+	            TEXT("%s: SINGLE LAYER WATER WITH OPACITY UNCONNECTED. Opacity ")
+	            TEXT("defaults to 1; the base pass reads WaterVisibility = 1 - Opacity ")
+	            TEXT("and skips the entire water volume at zero visibility. No scene ")
+	            TEXT("behind the water, no scattering, no absorption. The surface will ")
+	            TEXT("be opaque whatever its coefficients say."), Name);
+	    }
+	}
+
+	static void BF6_ReportMaterialState(const TCHAR* Name, UMaterial* M)
+	{
+	    if (!M) return;
+	    FString Models;
+	    const FMaterialShadingModelField SM = M->GetShadingModels();
+	    for (int32 s = 0; s < MSM_NUM; s++)
+	    {
+	        if (!SM.HasShadingModel((EMaterialShadingModel)s)) continue;
+	        if (!Models.IsEmpty()) Models += TEXT(" + ");
+	        Models += BF6_ShadingModelName((EMaterialShadingModel)s);
+	    }
+	    UE_LOG(LogBF6HighPoly, Log,
+	        TEXT("%s material: shading model %s, blend %s, %d expression(s)"),
+	        Name, Models.IsEmpty() ? TEXT("NONE") : *Models,
+	        BF6_BlendModeName(M->GetBlendMode()),
+	        M->GetExpressionCollection().Expressions.Num());
+	    BF6_ReportCustomOutputs(Name, M);
+	    BF6_ReportRootInputs(Name, M);
+	}
+
 	// ---- water ----------------------------------------------------------
 	//
 	// Its own parent rather than a seventh EKind: water is not a per-section
@@ -1355,7 +2776,37 @@ namespace
 	// with preset colours; here the engine does the real work - depth-based
 	// absorption and scattering, screen-space refraction, reflections - and
 	// the mined per-map colours drive the coefficients.
+	// THE FURTHEST PLACEMENT THIS LEVEL MAKES, in centimetres, so the sky can
+	// be sized to enclose it instead of to a constant. Measured on
+	// MP_Isolated: 135,093 m, which is three and a half times the 36.8 km the
+	// authored backdrop ring was believed to stop at.
+	float GFarWorldRadiusCm = 0.f;
+
 	UMaterial* GWaterParent = nullptr;
+
+	// THE AUTHORED COEFFICIENTS, kept per surface.
+	//
+	// How far you can see into the water is exp(-extinction * depth), so the
+	// one number worth moving is a scale on extinction. Scaling it live means
+	// knowing what was mined, which the instance would otherwise be the only
+	// record of. Same pattern as the light ceiling.
+	// THE ONE FREE NUMBER LEFT IN THE WATER.
+	//
+	// Extinction is decoded and the albedo hue is the level's own derived
+	// surface colour, so this scale is all that is not read from the game. It
+	// decides how much light comes back OUT of the water against how much is
+	// swallowed: at 1.0 the water returns as much as the level says its
+	// surface colour is, which on a bright reef is a lot. Turn it down if the
+	// water reads milky, up if it reads like ink.
+	float GWaterAlbedoScale = 1.f;
+
+	struct FWaterCoeff
+	{
+		TWeakObjectPtr<UMaterialInstanceDynamic> MID;
+		FLinearColor Scatter;
+		FLinearColor Absorb;
+	};
+	TArray<FWaterCoeff> GWaterCoeffs;
 
 	UMaterial* EnsureWaterMaterial()
 	{
@@ -1388,10 +2839,6 @@ namespace
 			Vec(TEXT("Scattering"), FLinearColor(0.010f, 0.038f, 0.045f), 260);
 		UMaterialExpressionVectorParameter* Absorb =
 			Vec(TEXT("Absorption"), FLinearColor(0.30f, 0.115f, 0.085f), 360);
-		if (SLW && Scatter)
-			UMaterialEditingLibrary::ConnectMaterialExpressions(Scatter, TEXT(""), SLW, TEXT("ScatteringCoefficients"));
-		if (SLW && Absorb)
-			UMaterialEditingLibrary::ConnectMaterialExpressions(Absorb, TEXT(""), SLW, TEXT("AbsorptionCoefficients"));
 
 		// THE SURFACE ALBEDO, which is what the game itself writes.
 		//
@@ -1439,6 +2886,18 @@ namespace
 		// game gets this detail from its simulation's normal cascades.
 		UMaterialExpressionScalarParameter* Det = Scal(TEXT("DetailRipple"), 1.f, 1220);
 		UMaterialExpressionScalarParameter* ShD = Scal(TEXT("ShoreFadeDistance"), 6.f, 1280);
+		// THE CLARITY RAMP IS NOT THE WAVE FADE, and reusing one number for
+		// both was wrong. The wave fade decides where swell stops running into
+		// the beach, and six metres is right for that. The clarity ramp is the
+		// composite's `saturate(d / cb51.y)`, and the authored ShoreDepth it
+		// corresponds to is 14.03 m on MP_Isolated and 100 on MP_Dumbo - far
+		// deeper. Sharing the wave's six metres made the water opaque a few
+		// steps out from the sand, when in game the shallows stay clear for a
+		// long stretch.
+		// No ClarityDepth parameter any more. It fed a ramp that duplicated
+		// the shading model's own exp(-extinction * depth), and the live knob
+		// that replaced it scales the EXTINCTION, which is the quantity that
+		// actually sets how far you can see.
 		UMaterialExpressionScalarParameter* ShF = Scal(TEXT("ShoreFoam"), 0.55f, 1340);
 		UMaterialExpressionVectorParameter* DMin =
 			Cast<UMaterialExpressionVectorParameter>(
@@ -1464,6 +2923,36 @@ namespace
 			Cast<UMaterialExpressionCameraPositionWS>(
 				UMaterialEditingLibrary::CreateMaterialExpression(
 					M, UMaterialExpressionCameraPositionWS::StaticClass(), -900, 840));
+
+		// THE DEPTH FADE IS THE SHADING MODEL'S OWN, not something bolted on.
+		//
+		// An earlier attempt multiplied both coefficients by saturate(d/D),
+		// on the belief that Single Layer Water "cannot fade its own result".
+		// That was wrong. The shading model integrates
+		//     Transmittance = exp(-Extinction * WaterVolumeDepth)
+		//     Scattering    = Albedo * (1 - Transmittance)
+		// (SingleLayerWaterShading.ush:219-227), so at zero depth transmittance
+		// is 1, scattering is 0, and the result is EXACTLY the background. The
+		// fade the game gets from saturate(d/D) is already there, as an
+		// exponential rather than a line, and it needs no help.
+		//
+		// Multiplying the coefficients by a second saturate(d/D) made the
+		// optical depth QUADRATIC near shore - extinction * d^2 / D - which is
+		// not what the game does and over-clears exactly the shallow water we
+		// were trying to fix. It also drove extinction to zero at the
+		// waterline, and Substrate's legacy conversion computes the albedo as
+		// scattering / extinction with no guard (SubstrateLegacyConversion.ush:
+		// 191), which is 0/0.
+		//
+		// The specular half has its own shore ramp in the composite,
+		// saturate(DeltaDepth * 0.02) at SingleLayerWaterComposite.usf:249.
+		if (SLW && Scatter)
+			UMaterialEditingLibrary::ConnectMaterialExpressions(Scatter, TEXT(""), SLW, TEXT("ScatteringCoefficients"));
+		if (SLW && Absorb)
+			UMaterialEditingLibrary::ConnectMaterialExpressions(Absorb, TEXT(""), SLW, TEXT("AbsorptionCoefficients"));
+		UE_LOG(LogBF6HighPoly, Log,
+			TEXT("water: coefficients connected directly; the depth fade is the ")
+			TEXT("shading model's own exp(-extinction * depth)"));
 
 		auto WaveInputs = [&](UMaterialExpressionCustom* X,
 		                      UMaterialExpressionWorldPosition* WP,
@@ -1562,6 +3051,12 @@ namespace
 		}
 
 		// ---- FOAM, from the folding of the displacement field -------------
+		//
+		// Hoisted out of the block because OPACITY needs it. On a Single Layer
+		// Water material Opacity is not "how much water": it is the coverage of
+		// whatever opaque material sits ON TOP of the water, and foam is
+		// exactly that. See the Opacity block below.
+		UMaterialExpressionCustom* FoamOut = nullptr;
 		if (WP && Tm && Gn && Ch && Bl && MnL && FTh && FMx && Wv[0])
 		{
 			UMaterialExpressionCustom* FoamX =
@@ -1629,6 +3124,88 @@ namespace
 					// B defaults to 1 = fully rough foam
 					UMaterialEditingLibrary::ConnectMaterialProperty(RoughMix, TEXT(""), MP_Roughness);
 				}
+				FoamOut = FoamX;
+			}
+		}
+
+		// ---- OPACITY: THE PIN THAT DECIDES WHETHER THIS IS WATER AT ALL ----
+		//
+		// This is what made every previous attempt fail, and not one of the
+		// coefficients was ever involved.
+		//
+		// On a Single Layer Water material Opacity means the COVERAGE OF THE
+		// MATERIAL LAYERED ON TOP OF THE WATER, not the water's own opacity.
+		// The base pass reads it as
+		//     BaseMaterialCoverageOverWater = Opacity      BasePassPixelShader.usf:1140
+		//     WaterVisibility = 1.0 - BaseMaterialCoverageOverWater
+		// and the whole of EvaluateWaterVolumeLighting sits inside
+		//     if (WaterVisibility > 0.0f)                  SingleLayerWaterShading.ush:74
+		// so at Opacity 1 the scene behind the water is never sampled, the
+		// transmittance is never applied and the scattering is never added.
+		// What is left is a lit sheet of BaseColor plus a reflection, whatever
+		// the extinction says. That is why WaterClarity 5000 changed nothing:
+		// extinction was never consulted.
+		//
+		// Unconnected, Opacity IS 1 - FVector4(1,0,0,0) in
+		// MaterialAttributeDefinitionMap.cpp:401 - and MP_Opacity stays an
+		// active property for this shading model at any blend mode
+		// (Material.cpp:7976). Substrate lands in the same place: the legacy
+		// conversion passes it straight into TopMaterialOpacity
+		// (SubstrateLegacyConversion.ush:201) and the base pass reads it back
+		// at line 1090. The trap is that Unreal's own Substrate water node
+		// defaults this same quantity to ZERO. Only the legacy root pin
+		// defaults to one.
+		//
+		// So: zero for open water, and the foam mask where an opaque layer
+		// really does sit on the surface.
+		{
+			UMaterialExpressionScalarParameter* FoamCov =
+				Cast<UMaterialExpressionScalarParameter>(
+					UMaterialEditingLibrary::CreateMaterialExpression(
+						M, UMaterialExpressionScalarParameter::StaticClass(), -400, -60));
+			if (FoamCov)
+			{
+				FoamCov->ParameterName = TEXT("FoamCoverage");
+				FoamCov->DefaultValue = 1.f;
+			}
+			UMaterialExpressionMultiply* OpMul =
+				(FoamOut && FoamCov)
+				? Cast<UMaterialExpressionMultiply>(
+					UMaterialEditingLibrary::CreateMaterialExpression(
+						M, UMaterialExpressionMultiply::StaticClass(), -100, -60))
+				: nullptr;
+			if (OpMul)
+			{
+				UMaterialEditingLibrary::ConnectMaterialExpressions(FoamOut, TEXT(""), OpMul, TEXT("A"));
+				UMaterialEditingLibrary::ConnectMaterialExpressions(FoamCov, TEXT(""), OpMul, TEXT("B"));
+				UMaterialEditingLibrary::ConnectMaterialProperty(OpMul, TEXT(""), MP_Opacity);
+				UE_LOG(LogBF6HighPoly, Log,
+					TEXT("water: opacity wired to the foam mask (0 = clear water, ")
+					TEXT("1 = opaque foam on top)"));
+			}
+			else
+			{
+				// NO FOAM NODE, SO A HARD ZERO. Falling through here and
+				// leaving Opacity unconnected is the exact bug this block
+				// exists to fix, so the fallback must still connect something.
+				UMaterialExpressionConstant* Zero =
+					Cast<UMaterialExpressionConstant>(
+						UMaterialEditingLibrary::CreateMaterialExpression(
+							M, UMaterialExpressionConstant::StaticClass(), -100, -60));
+				if (Zero)
+				{
+					Zero->R = 0.f;
+					UMaterialEditingLibrary::ConnectMaterialProperty(Zero, TEXT(""), MP_Opacity);
+					UE_LOG(LogBF6HighPoly, Log,
+						TEXT("water: opacity wired to constant 0 (no foam node built)"));
+				}
+				else
+				{
+					UE_LOG(LogBF6HighPoly, Error,
+						TEXT("water: OPACITY IS NOT CONNECTED. It defaults to 1, which ")
+						TEXT("makes WaterVisibility 0 and skips the entire water volume - ")
+						TEXT("the surface will be opaque whatever its colours say."));
+				}
 			}
 		}
 
@@ -1646,6 +3223,14 @@ namespace
 		UE_LOG(LogBF6HighPoly, Log,
 			TEXT("water material built (shaders compile async - if the surface draws flat ")
 			TEXT("grey, search the log for 'Failed to compile Material')"));
+		// SAID ON EVERY BUILD, not only when someone runs the check.
+		//
+		// This material has been wrong for days and the self-check did not cover
+		// it, so no line in the log has ever said what it actually is. A shading
+		// model that failed to stick, and a custom output pin quietly running on
+		// its default, both draw a surface that looks merely wrong rather than
+		// broken.
+		BF6_ReportMaterialState(TEXT("water"), M);
 		GWaterParent = M;
 		return M;
 	}
@@ -1757,12 +3342,58 @@ namespace
 		// Choppiness is the value that actually separates these maps (0.02 on
 		// Aftermath against 0.60 on Tungsten) so it carries most of the
 		// weight here, with wind speed as a multiplier on top.
-		R.Gain = FMath::Clamp(
-			(0.45f + 1.60f * FMath::Sqrt(FMath::Clamp(S.Choppiness, 0.f, 3.f))) *
-			FMath::Clamp(FMath::Sqrt(FMath::Max(S.WindSpeed, 0.f) / 0.07f), 0.55f, 2.2f),
-			0.30f, 4.0f);
-		// Choppiness -> crest sharpening, clamped below 1 or the phase warp
-		// folds crests into themselves.
+		// WIND SPEED -> AMPLITUDE, AS A SQUARE LAW.
+		//
+		// This used to be sqrt(windSpeed / 0.07) clamped to a FLOOR of 0.55,
+		// with a constant 0.45 added on top. Both were wrong in the same
+		// direction. The header documents wind_speed as a normalised scalar
+		// where 0.01 is calm, 0.07 is windy and 0.30 is a D-Day sea; a square
+		// root compresses that whole range into a factor of five, and the
+		// floor then guaranteed roughly a quarter metre of swell no matter how
+		// calm the water was authored. MP_Aftermath is a CANAL authored at
+		// wind_speed 0.010 and came out with two thirds of a metre of ocean
+		// swell on it.
+		//
+		// A Phillips spectrum - the family the decoded dispersion kernel
+		// belongs to - has wave height scaling with the SQUARE of wind speed,
+		// so calm water is dramatically calmer than windy water rather than
+		// slightly calmer. Note the honest limit here: findings/
+		// ocean-fft-kernels-decoded.md establishes there is NO H0 kernel
+		// anywhere in the GPU store, so the exact authored spectrum is not
+		// recovered and this is the right physics rather than the game's
+		// literal curve.
+		// THE REFERENCE IS 0.5, NOT 0.07.
+		//
+		// The core's header used to document this scalar as "0.01 calm, 0.07
+		// windy, 0.30 the D-Day sea", and that scale was read through the
+		// SINGLE PLAYER reflection schema, which lays the class out
+		// differently. Under the multiplayer schema the class DEFAULT is 0.5
+		// and MP_Isolated authors 0.914. Calibrating against 0.07 therefore
+		// squared a number about ten times too large and pinned every map to
+		// the clamp, which is why the sea was a wall of four metre swell on
+		// maps the game draws nearly flat.
+		const float Vref = 0.5f;         // the class default: the authored middle
+		const float AmpAtVref = 0.35f;   // metres for the ratio-1 component
+		const float V = FMath::Max(S.WindSpeed, 0.f);
+		float Amp = AmpAtVref * FMath::Square(V / Vref);
+		// Choppiness sharpens crests. It must not MANUFACTURE height on water
+		// the level authored as flat, so it scales the amplitude rather than
+		// adding to it.
+		Amp *= 0.6f + 0.8f * FMath::Clamp(S.Choppiness, 0.f, 1.f);
+
+		// AND THE TILE BOUNDS IT. Wind speed alone does not decide wave height:
+		// the simulation tile does too, because a swell longer than the tile
+		// cannot exist in it. MP_Aftermath runs an 8 m tile and MP_Isolated a
+		// 300 m one, and treating those two as differing only by wind is how a
+		// canal ends up with ocean on it. Two percent of the tile is a
+		// deliberate CALIBRATION rather than a decoded ratio - the authored
+		// per-cascade displacement scale is a runtime value we do not read -
+		// so it is one number to move if the sea reads wrong.
+		if (S.TileDimension > 0.f)
+		{
+			Amp = FMath::Min(Amp, S.TileDimension * 0.02f);
+		}
+		R.Gain = FMath::Clamp(Amp, 0.002f, 4.0f);
 		R.Chop = FMath::Clamp(S.Choppiness, 0.05f, 0.9f);
 		// SWELL SCALES WITH THE BODY OF WATER. A 10 km ocean does not carry
 		// the same wave lengths as a 200 m lake, and a fixed 34 m made the
@@ -1840,7 +3471,13 @@ namespace
 	// while blue-green survives twenty, and what comes back up is the sand
 	// seen through a blue filter. So scattering stays low and absorption
 	// carries the colour.
-	float ScatterPerM = 0.055f;
+	// Tuned against the two failure modes actually seen, not from a table.
+	// At 0.60 the water was MILK - too much light coming back, and coming back
+	// too evenly across the channels. At 0.055 it was nearly BLACK, because a
+	// few centimetres of scattering per metre returns almost nothing. This
+	// sits between them, and the hue is squared where it is applied below so
+	// that raising the strength does not drag the colour back toward white.
+	float ScatterPerM = 0.22f;
 	float AbsorbPerM  = 0.50f;
 	// The surface's own diffuse albedo. Water is a REFLECTOR, not a diffuser:
 	// this belongs near black. It was near-black once, produced black water,
@@ -1929,18 +3566,823 @@ namespace
 
 		// SCATTERING is what comes back out: the water's own colour, at a
 		// strength set by how bright the map authored it.
-		MID->SetVectorParameterValue(TEXT("Scattering"), FLinearColor(
-			Hue.R * Bright * ScatterPerM,
-			Hue.G * Bright * ScatterPerM,
-			Hue.B * Bright * ScatterPerM));
+		//
+		// The hue is SQUARED here. A reef's authored colour is only mildly
+		// tinted - Tsuru's (0.569, 0.829, 0.890) normalises to a hue of
+		// (0.64, 0.93, 1.00), which is very nearly white - so scattering along
+		// it at any strength high enough to read as vibrant also reads as
+		// milk. Squaring pulls it to (0.41, 0.87, 1.00) and lets the strength
+		// go up while the colour goes toward blue instead of toward white.
+		const FLinearColor Sat(Hue.R * Hue.R, Hue.G * Hue.G, Hue.B * Hue.B);
+
+		// PER CENTIMETRE, NOT PER METRE.
+		//
+		// Single Layer Water computes OpticalDepth = ExtinctionCoeff *
+		// WaterVolumeDepth, and WaterVolumeDepth is a scene depth difference
+		// in Unreal units - centimetres. Feeding it a per-metre coefficient
+		// makes the water a HUNDRED TIMES too opaque, which is not a subtle
+		// error: at 0.22 per centimetre a mere ten centimetres of water has an
+		// optical depth of 2.2 and you cannot see the sand through it.
+		//
+		// This is what every previous water attempt was actually fighting.
+		// 0.60 read as milk (opaque, scattering a lot) and 0.055 read as
+		// near-black (opaque, scattering little) - both opaque, because both
+		// were a hundredfold too strong, and no amount of colour tuning was
+		// ever going to fix either.
+		const float ToPerCm = 0.01f;
+
+		// THE DECODED EXTINCTION, WHERE THE LEVEL AUTHORS ONE.
+		//
+		// Everything below this block is the fallback heuristic: it treats the
+		// authored colour as a hue plus a brightness and pushes them through
+		// two constants. It is wrong twice over, and the second way is worse.
+		//
+		// On MP_Isolated the decode gives extinction per metre of
+		//     R 0.28208   G 0.09379   B 0.05826
+		// which is half transmittance at 2.46 m, 7.39 m and 11.90 m, and green
+		// still at a tenth by 24.5 m. The heuristic gave
+		//     R 0.17216   G 0.20358   B 0.21580
+		// which is 2.2x too strong in green and 3.7x too strong in blue, so
+		// the water clears only in the shallows. And it is nearly FLAT across
+		// the channels, absorbing blue marginally harder than red, which is
+		// backwards: water kills red first and carries blue furthest. That is
+		// the whole reason deep water is blue.
+		//
+		// The authored colour is not a colour. On the ocean family it is a
+		// per-metre TRANSMISSION - what the water reaches after
+		// AbsorptionDistanceM metres, 2.0 m on this level - and the core hands
+		// back the conversion so this never has to know the formula.
+		if (W.Extinction.R >= 0.f)
+		{
+			// SPLITTING EXTINCTION INTO SCATTER AND ABSORB, and the previous
+			// split was a category error that made the water milky.
+			//
+			// Unreal wants both, and their ratio is the single-scattering
+			// albedo - what colour light comes back as. This used the level's
+			// derived SurfaceColour as that albedo. SurfaceColour is not an
+			// albedo: it is a TRANSMISSION. Measured, it is exp(-extinction x
+			// 1 m) to within 0.004 in green and 0.002 in blue. Feeding a
+			// transmittance in as an albedo gave (0.718, 0.906, 0.942) - very
+			// nearly white, with green and blue within 4% of each other - so
+			// deep water scattered back pale cyan with no blue dominance at
+			// all. That reads as murky green.
+			//
+			// THE COLOUR OF WATER IS NOT IN ITS SCATTERING, IT IS IN ITS
+			// ABSORPTION. Scattering in clear water is close to spectrally
+			// FLAT; red is absorbed 4.8 times harder than blue here, and what
+			// survives to scatter back is therefore blue. So the scattering
+			// coefficient is one number for all three channels and every bit
+			// of the colour comes out of the decoded extinction.
+			//
+			// It is capped at the WEAKEST channel's extinction, because
+			// scattering cannot exceed extinction - absorption would have to
+			// go negative. Blue is always the weakest, so blue ends up with an
+			// albedo near 1 and red near 0.2, which is exactly the ratio that
+			// makes deep water blue.
+			//
+			// This is a stated MODEL rather than a decoded quantity, and the
+			// one free number in it is exposed as BF6.HighPoly.WaterAlbedo.
+			const float ExtMin = FMath::Min3(W.Extinction.R, W.Extinction.G,
+			                                 W.Extinction.B);
+			const float ScatterFlat =
+				FMath::Max(ExtMin * FMath::Clamp(GWaterAlbedoScale, 0.f, 1.f), 0.f);
+			auto Split = [&](float Ext) -> TPair<float, float>
+			{
+				const float S = FMath::Min(ScatterFlat, Ext);
+				return TPair<float, float>(S, FMath::Max(Ext - S, 0.f));
+			};
+			const TPair<float, float> Rr = Split(W.Extinction.R);
+			const TPair<float, float> Gg = Split(W.Extinction.G);
+			const TPair<float, float> Bb = Split(W.Extinction.B);
+			const FLinearColor ScatterCm(Rr.Key * ToPerCm, Gg.Key * ToPerCm, Bb.Key * ToPerCm);
+			const FLinearColor AbsorbCm (Rr.Value * ToPerCm, Gg.Value * ToPerCm, Bb.Value * ToPerCm);
+			MID->SetVectorParameterValue(TEXT("Scattering"), ScatterCm);
+			MID->SetVectorParameterValue(TEXT("Absorption"), AbsorbCm);
+			GWaterCoeffs.Add({ MID, ScatterCm, AbsorbCm });
+			auto HalfM = [](float E) { return E > 1e-9f ? 0.6931f / E : 0.f; };
+			UE_LOG(LogBF6HighPoly, Log,
+				TEXT("water: DECODED extinction /m (%.5f %.5f %.5f) over %.2f m ")
+				TEXT("absorption distance - you can see half way down at ")
+				TEXT("R %.1f m, G %.1f m, B %.1f m"),
+				W.Extinction.R, W.Extinction.G, W.Extinction.B,
+				W.AbsorptionDistanceM,
+				HalfM(W.Extinction.R), HalfM(W.Extinction.G), HalfM(W.Extinction.B));
+			auto AlbOf = [](float S, float E) { return E > 1e-9f ? S / E : 0.f; };
+			UE_LOG(LogBF6HighPoly, Log,
+				TEXT("water: flat scattering %.5f /m gives albedo (%.3f %.3f %.3f) - ")
+				TEXT("blue scatters back and red is absorbed, which is what makes ")
+				TEXT("water blue. Move it with BF6.HighPoly.WaterAlbedo"),
+				ScatterFlat,
+				AlbOf(Rr.Key, W.Extinction.R), AlbOf(Gg.Key, W.Extinction.G),
+				AlbOf(Bb.Key, W.Extinction.B));
+			return MID;
+		}
+		UE_LOG(LogBF6HighPoly, Warning,
+			TEXT("water: no decoded extinction for this surface, falling back to ")
+			TEXT("the hue-and-brightness heuristic - expect it to clear only in ")
+			TEXT("the shallows"));
+
+		const FLinearColor ScatterCm0(
+			Sat.R * Bright * ScatterPerM * ToPerCm,
+			Sat.G * Bright * ScatterPerM * ToPerCm,
+			Sat.B * Bright * ScatterPerM * ToPerCm);
+		MID->SetVectorParameterValue(TEXT("Scattering"), ScatterCm0);
 		// ABSORPTION is the complement of the hue: the channels the water
 		// does NOT return are the ones it takes out of the beam, which is
 		// why red dies within a metre or two and blue-green carries.
-		MID->SetVectorParameterValue(TEXT("Absorption"), FLinearColor(
-			(1.f - Hue.R) * AbsorbPerM + 0.02f,
-			(1.f - Hue.G) * AbsorbPerM + 0.02f,
-			(1.f - Hue.B) * AbsorbPerM + 0.02f));
+		const FLinearColor AbsorbCm(
+			((1.f - Hue.R) * AbsorbPerM + 0.02f) * ToPerCm,
+			((1.f - Hue.G) * AbsorbPerM + 0.02f) * ToPerCm,
+			((1.f - Hue.B) * AbsorbPerM + 0.02f) * ToPerCm);
+		MID->SetVectorParameterValue(TEXT("Absorption"), AbsorbCm);
+		GWaterCoeffs.Add({ MID, ScatterCm0, AbsorbCm });
+
+		// WHAT ACTUALLY REACHES THE SHADER, and the depth it implies.
+		//
+		// Said out loud because two rounds of tuning this by eye were wasted
+		// arguing about numbers nobody had looked at. Extinction is per
+		// CENTIMETRE, so the useful sanity check is the depth at which the
+		// water reaches half transmittance: ln(2)/extinction, in metres. A
+		// sea you can see a metre into has a half-depth of about a metre; if
+		// this prints centimetres the water is opaque and no colour tuning
+		// will save it.
+		const FLinearColor ScatterCm(
+			Sat.R * Bright * ScatterPerM * ToPerCm,
+			Sat.G * Bright * ScatterPerM * ToPerCm,
+			Sat.B * Bright * ScatterPerM * ToPerCm);
+		auto HalfDepthM = [](float Scat, float Abs) -> float
+		{
+			const float Ext = FMath::Max(Scat + Abs, 1e-8f);
+			return 0.6931f / Ext * 0.01f;      // cm -> m
+		};
+		UE_LOG(LogBF6HighPoly, Log,
+			TEXT("water colour: authored shallow (%.3f %.3f %.3f) -> hue (%.2f %.2f %.2f) bright %.2f"),
+			C.R, C.G, C.B, Hue.R, Hue.G, Hue.B, Bright);
+		UE_LOG(LogBF6HighPoly, Log,
+			TEXT("water coeffs /cm: scatter (%.5f %.5f %.5f) absorb (%.5f %.5f %.5f)"),
+			ScatterCm.R, ScatterCm.G, ScatterCm.B, AbsorbCm.R, AbsorbCm.G, AbsorbCm.B);
+		UE_LOG(LogBF6HighPoly, Log,
+			TEXT("water half-transmittance depth: R %.2f m, G %.2f m, B %.2f m ")
+			TEXT("(surface tint %.3f %.3f %.3f)"),
+			HalfDepthM(ScatterCm.R, AbsorbCm.R),
+			HalfDepthM(ScatterCm.G, AbsorbCm.G),
+			HalfDepthM(ScatterCm.B, AbsorbCm.B),
+			Hue.R * SurfaceAlbedo, Hue.G * SurfaceAlbedo, Hue.B * SurfaceAlbedo);
 		return MID;
+	}
+
+	// ---- the map's own SKY ------------------------------------------------
+	//
+	// Every level ships a painted HDR panorama, 8192 by 2048 on fourteen of
+	// them, and the tool drew a generic procedural atmosphere instead. So every
+	// map got the same Unreal blue, and the sky light - set to capture the
+	// scene in real time - captured that generic blue as its ambient. Both
+	// halves of the environment were somebody else's.
+	//
+	// That is the honest explanation for a run of brightness complaints. It was
+	// never a calibration constant: the sky simply was not the map's.
+	//
+	// The panorama covers the UPPER HEMISPHERE only, which is what its 4:1
+	// aspect means - 360 degrees of azimuth by 90 of elevation. Row 0 is the
+	// zenith. Below the horizon the mapping clamps to the horizon row, which is
+	// what the game's own dome does.
+	UMaterial* GSkyParent = nullptr;
+
+	UMaterial* EnsureSkyMaterial()
+	{
+		if (GSkyParent) return GSkyParent;
+		UPackage* Pkg = CreatePackage(TEXT("/Temp/BF6HighPoly_Sky"));
+		if (!Pkg) return nullptr;
+		Pkg->SetFlags(RF_Transient);
+		UMaterial* M = NewObject<UMaterial>(Pkg, TEXT("M_BF6HighPoly_Sky"), RF_Transient);
+		if (!M) return nullptr;
+		M->MaterialDomain = MD_Surface;
+		M->SetShadingModel(MSM_Unlit);
+		M->BlendMode = BLEND_Opaque;
+		// Seen from the inside, and it must never occlude or shadow anything.
+		M->TwoSided = true;
+		M->bIsSky = true;
+
+		UMaterialExpressionTextureObjectParameter* Pano =
+			Cast<UMaterialExpressionTextureObjectParameter>(
+				UMaterialEditingLibrary::CreateMaterialExpression(
+					M, UMaterialExpressionTextureObjectParameter::StaticClass(), -600, 0));
+		if (Pano)
+		{
+			Pano->ParameterName = TEXT("Panorama");
+			Pano->SamplerType = SAMPLERTYPE_LinearColor;
+			Pano->Texture = LinearWhite();
+		}
+		auto Scal = [&](const TCHAR* Name, float Def, int32 Y)
+			-> UMaterialExpressionScalarParameter*
+		{
+			UMaterialExpressionScalarParameter* P =
+				Cast<UMaterialExpressionScalarParameter>(
+					UMaterialEditingLibrary::CreateMaterialExpression(
+						M, UMaterialExpressionScalarParameter::StaticClass(), -600, Y));
+			if (P) { P->ParameterName = Name; P->DefaultValue = Def; }
+			return P;
+		};
+		UMaterialExpressionScalarParameter* Rot   = Scal(TEXT("SkyRotationTurns"), 0.f, 120);
+		UMaterialExpressionScalarParameter* VMin  = Scal(TEXT("SkyVMin"), 0.f, 200);
+		UMaterialExpressionScalarParameter* VMax  = Scal(TEXT("SkyVMax"), 1.f, 280);
+		UMaterialExpressionScalarParameter* Scale = Scal(TEXT("SkyEmissiveScale"), 1.f, 360);
+
+		UMaterialExpressionWorldPosition* WP =
+			Cast<UMaterialExpressionWorldPosition>(
+				UMaterialEditingLibrary::CreateMaterialExpression(
+					M, UMaterialExpressionWorldPosition::StaticClass(), -600, 440));
+		UMaterialExpressionCameraPositionWS* CamP =
+			Cast<UMaterialExpressionCameraPositionWS>(
+				UMaterialEditingLibrary::CreateMaterialExpression(
+					M, UMaterialExpressionCameraPositionWS::StaticClass(), -600, 520));
+
+		UMaterialExpressionCustom* Dome =
+			Cast<UMaterialExpressionCustom>(
+				UMaterialEditingLibrary::CreateMaterialExpression(
+					M, UMaterialExpressionCustom::StaticClass(), -200, 200));
+		if (Dome && Pano && Rot && VMin && VMax && Scale && WP && CamP)
+		{
+			Dome->Description = TEXT("BF6 sky dome");
+			Dome->OutputType = CMOT_Float3;
+			Dome->Code = TEXT(R"HLSL(
+float3 d = normalize(WPos - CamPos);
+// The game's bearing is measured from its +Z, turning toward +X, and game +Z
+// is Unreal +Y, so atan2(x, y) IS the bearing.
+//
+// MINUS the rotation, and NO half turn. Solved against the fleet rather than
+// guessed: the painted sun sits at the panorama's u = 0.5 column, measured
+// independently on five maps, so the authored rotation must be whatever
+// carries the authored sun bearing to that column. Over the 15 panoramic-sky
+// levels, u = az/360 - rot lands the sun at a median |u - 0.5| of 0.0072
+// turns, which is 2.6 degrees, with 14 of 15 inside 0.04. The other three sign
+// and offset combinations score 0.245 to 0.493, and a shuffled pairing of
+// rotations against azimuths matched the true one in 0 of 400 trials.
+//
+// The one level that misses is mp_contaminated at 0.239, whose authored sun is
+// near due north; not chased.
+//
+// AND THE HANDEDNESS IS MIRRORED, which the |u - 0.5| test could not tell.
+//
+// Those two candidates are reflections about u = 0.5, so a painted sun sitting
+// at 0.5 fits both. What separates them is that they are NOT equally 0.5 on
+// every level - the gap reaches 0.076 turns on mp_tungsten - so ranking levels
+// by an INDEPENDENT quality metric settles it. Using how well the painted
+// sun's ELEVATION matches the authored SunRotationY, which carries no azimuth
+// information at all, the four best levels favour the mirrored branch 4 of 4
+// with a mean azimuth error of 1.2 degrees against 10.4, the best eight favour
+// it 6 of 8, and 0 of 400 shuffled pairings match.
+//
+// So u DECREASES as the bearing turns from game +Z toward +X.
+float u = frac(Rot - atan2(d.x, d.y) / 6.2831853);
+// UPPER HEMISPHERE ONLY. Row 0 is the zenith, so elevation runs 90 degrees at
+// v = 0 down to the horizon at v = 1, and anything below the horizon holds on
+// the horizon row rather than wrapping to the top of the image.
+float e = degrees(asin(clamp(d.z, -1.0, 1.0)));
+float v = saturate(1.0 - max(e, 0.0) / 90.0);
+v = lerp(VMinY, VMaxY, v);
+return Texture2DSample(Pano, PanoSampler, float2(u, v)).rgb * Scale;
+)HLSL");
+			Dome->Inputs.Empty();
+			auto In = [&Dome](const TCHAR* Nm, UMaterialExpression* E)
+			{ FCustomInput I; I.InputName = Nm; I.Input.Expression = E; Dome->Inputs.Add(I); };
+			In(TEXT("WPos"), WP);
+			In(TEXT("CamPos"), CamP);
+			In(TEXT("Pano"), Pano);
+			In(TEXT("Rot"), Rot);
+			In(TEXT("VMinY"), VMin);
+			In(TEXT("VMaxY"), VMax);
+			In(TEXT("Scale"), Scale);
+			UMaterialEditingLibrary::ConnectMaterialProperty(Dome, TEXT(""), MP_EmissiveColor);
+		}
+
+		M->PreEditChange(nullptr);
+		M->PostEditChange();
+		BF6_ReportMaterialState(TEXT("sky"), M);
+		GSkyParent = M;
+		return M;
+	}
+
+	// ---- the map's own lighting ------------------------------------------
+	//
+	// TWO HALVES, and the tool had neither. The ENVIRONMENT comes from the
+	// level's VisualEnvironment: a sun with a real bearing, elevation, linear
+	// tint and illuminance in LUX, an atmosphere, and fog. The LOCAL LIGHTS
+	// are every lamp, spot, tube and lit panel the level places, of which a
+	// map ships thousands - 7,878 on MP_Dumbo, 3,874 on MP_Aftermath.
+	//
+	// Before this the whole world was lit by one directional light at a
+	// hard-coded intensity of 3, with no sky and no ambient. That is why
+	// interiors were black and why water read as dark whatever its own
+	// coefficients said: water is mostly REFLECTED SKY, and there was no sky.
+	int32 GLightsBuilt = 0;
+
+	// The ceiling on an authored light, in lumens. See BuildLights: the fleet
+	// authors up to 6e7 and the raw-to-renderer conversion is not decoded, so
+	// this is a calibration, not a reading.
+	float GLightLumenMax = 50000.f;
+
+	// WHAT WAS AUTHORED, kept alongside what was built.
+	//
+	// The ceiling above is a calibration and the user has said the lamps read
+	// too bright, so the number needs to be FOUND rather than argued about.
+	// Re-applying it means knowing each light's authored value, which the
+	// clamp would otherwise have thrown away, so it is retained here and the
+	// ceiling becomes a live command instead of a rebuild.
+	TArray<TPair<TWeakObjectPtr<ULightComponent>, float>> GAuthoredLights;
+
+	// Thousands of ACTORS would be thousands of entries in the outliner and a
+	// spawn cost to match. These are components on the add-on's own actor
+	// instead, named so the layer switch can find them.
+	template <typename TComp>
+	TComp* AddLightComp(AActor* A, USceneComponent* Root, int32 Index, const TCHAR* Kind)
+	{
+		TComp* C = NewObject<TComp>(
+			A, *FString::Printf(TEXT("Light_%s_%d"), Kind, Index), RF_Transient);
+		if (!C) return nullptr;
+		C->SetupAttachment(Root);
+		C->RegisterComponent();
+		return C;
+	}
+
+	int32 BuildLights(AActor* A, USceneComponent* Root,
+	                  const TArray<BF6HP::FCore::FLight>& Lights)
+	{
+		int32 Made = 0, SkippedDark = 0, Clamped = 0, Luminance = 0;
+		double SumLm = 0.0;
+		float MaxLm = 0.f;
+		GAuthoredLights.Reset();
+		GAuthoredLights.Reserve(Lights.Num());
+		for (int32 i = 0; i < Lights.Num(); i++)
+		{
+			const BF6HP::FCore::FLight& L = Lights[i];
+			// AUTHORED LUMENS ARE NOT DIRECTLY AN UNREAL INTENSITY.
+			//
+			// MP_Isolated's lights run a median of 4,000 lm and a MAXIMUM of
+			// 60,000,000. Six times ten to the seven lumens is not a lamp, and
+			// it is not meant to be read as one: the game converts authored
+			// intensity to renderer energy somewhere we have not decoded, and
+			// the census that measured these said so explicitly. Passing the
+			// raw figure through is the same mistake as feeding the sun its
+			// authored 139,610 lux, one subsystem over.
+			//
+			// So the absurd tail is clamped. GLightLumenMax is deliberately one
+			// number to move, and the count that hits it is logged rather than
+			// swallowed, because a clamp that silently eats half a map's lights
+			// would look like the lights simply being wrong.
+			// LUMENS FOR EVERYTHING, because that is what the game's own
+			// conversion takes and what Unreal's own conversion expects.
+			//
+			// The engine converts an authored quantity to renderer energy in
+			// LightRenderDB.cpp::convertToLightInfo, one published Frostbite
+			// formula per emitter shape, all of them dividing a LUMINOUS POWER
+			// P by the emitter's solid angle or area:
+			//     sphere, punctual   I = P / 4pi
+			//     sphere, radius r   L = P / (4 pi^2 r^2)
+			//     rectangle w by h   L = P / (pi w h)
+			//     tube  r, length l  L = P / (pi (2 pi r l + 4 pi r^2))
+			//     spot, outer angle  I = P / (2 pi (1 - cos(outer/2)))
+			//                    OR  I = P / 4 pi, and which one is chosen by a
+			//                        bool this reader CANNOT SEE: it lives on
+			//                        PbrSpotLightDynamicState and on no
+			//                        EntityData class, so it is runtime state
+			//                        rather than authored data. Unreal's Lumens
+			//                        path uses the cone form, which is the
+			//                        physically correct branch. No correction
+			//                        factor is applied for the other one,
+			//                        because guessing which lights take it
+			//                        would be inventing data.
+			// Unreal implements the same photometry when it is given Lumens
+			// (PointLightComponent.cpp:143, SpotLightComponent.cpp:95), so
+			// handing it P is handing it the decode rather than a calibration.
+			//
+			// AND THE UNIT IS NOT WHAT WE THOUGHT. LightUnit 1 is LUMINANCE,
+			// in nits, not candelas - the conversion above is SKIPPED for it
+			// and the authored number is used as the emitted luminance
+			// directly. Feeding a luminance to Unreal as candelas was simply
+			// wrong. It is turned back into a power here by multiplying by the
+			// emitter area, which is the same formula run backwards, so both
+			// unit types arrive as lumens and nothing downstream has to care.
+			float Lum = L.Intensity;
+			if (L.Unit == 1)
+			{
+				const float R = FMath::Max(L.ShapeRadiusM, 0.f);
+				float Area = 0.f;
+				if (L.Type == 3)                     // rect
+				{
+					const float H = FMath::Max(L.RectHeightM, 0.f);
+					Area = PI * H * (H * FMath::Max(L.RectAspect, 0.01f));
+				}
+				else if (L.Type == 2 && R > 0.f)     // tube
+				{
+					Area = PI * (2.f * PI * R * FMath::Max(L.TubeWidthM, 0.f)
+					             + 4.f * PI * R * R);
+				}
+				else if (L.Type == 1 && R > 0.f)     // spot with a disc
+				{
+					// The disc spot is pi^2 r^2, NOT the sphere's 4 pi^2 r^2.
+					// Separate leaf in the engine's own function.
+					Area = PI * PI * R * R;
+				}
+				else if (R > 0.f)                    // sphere with a real radius
+				{
+					Area = 4.f * PI * PI * R * R;
+				}
+				// No area means a punctual emitter, where a luminance has no
+				// meaning and the authored figure can only be an intensity.
+				// The rect's punctual case divides by pi rather than 4 pi.
+				Lum *= (Area > 0.f) ? Area : (L.Type == 3 ? PI : 4.f * PI);
+			}
+			Lum *= (L.Dimmer > 0.f ? L.Dimmer : 1.f);
+			const float Authored = Lum;
+			if (L.Unit == 1) Luminance++;
+			SumLm += Authored;
+			MaxLm = FMath::Max(MaxLm, Authored);
+			if (Lum > GLightLumenMax) { Lum = GLightLumenMax; Clamped++; }
+			// A light with no energy or no reach is not a light. Both occur in
+			// the data and both would cost a component for nothing.
+			if (Lum <= 0.f || L.AttenuationRadiusM <= 0.f) { SkippedDark++; continue; }
+
+			// Same basis conversion the props take: Y and Z swap, and the
+			// basis carries the holder's SCALE, so a row must be normalised
+			// before it can be used as a direction.
+			const FVector X(L.Right.X,   L.Right.Z,   L.Right.Y);
+			const FVector Y(L.Up.X,      L.Up.Z,      L.Up.Y);
+			const FVector Z(L.Forward.X, L.Forward.Z, L.Forward.Y);
+			const FTransform Xf(FMatrix(X, Z, Y, ToUnreal(L.Origin)));
+
+			ULightComponent* Base = nullptr;
+			if (L.Type == 1)          // spot
+			{
+				if (USpotLightComponent* S =
+					AddLightComp<USpotLightComponent>(A, Root, i, TEXT("Spot")))
+				{
+					// THE GAME AUTHORS FULL CONE ANGLES, Unreal wants HALF.
+					S->SetInnerConeAngle(FMath::Clamp(L.InnerAngleDeg * 0.5f, 0.f, 89.f));
+					S->SetOuterConeAngle(FMath::Clamp(L.OuterAngleDeg * 0.5f, 1.f, 89.f));
+					Base = S;
+				}
+			}
+			else if (L.Type == 3)     // rect
+			{
+				if (URectLightComponent* R =
+					AddLightComp<URectLightComponent>(A, Root, i, TEXT("Rect")))
+				{
+					// There is no Width field on the class: it is Height times
+					// Aspect, and both are metres before the holder's scale.
+					R->SourceHeight = FMath::Max(1.f, L.RectHeightM * 100.f);
+					R->SourceWidth  = FMath::Max(1.f, L.RectHeightM * FMath::Max(L.RectAspect, 0.01f) * 100.f);
+					Base = R;
+				}
+			}
+			else                       // sphere and tube both land on a point light
+			{
+				if (UPointLightComponent* Pt =
+					AddLightComp<UPointLightComponent>(A, Root, i, TEXT("Point")))
+				{
+					Pt->SourceRadius = FMath::Max(0.f, L.ShapeRadiusM * 100.f);
+					if (L.Type == 2) Pt->SourceLength = FMath::Max(0.f, L.TubeWidthM * 100.f);
+					Base = Pt;
+				}
+			}
+			if (!Base) continue;
+
+			Base->SetWorldTransform(Xf);
+			// LINEAR, not sRGB: the authored colour is already linear and
+			// pushing it through the sRGB path would wash every lamp out.
+			Base->SetLightColor(L.Color, /*bSRGB*/ false);
+			// The data is in LUMENS for all but a handful of lights, which is
+			// a unit Unreal understands directly.
+			if (ULocalLightComponent* Local = Cast<ULocalLightComponent>(Base))
+			{
+				// Always lumens now: the luminance case was converted above.
+				Local->SetIntensityUnits(ELightUnits::Lumens);
+				Local->SetAttenuationRadius(L.AttenuationRadiusM * 100.f);
+			}
+			Base->SetIntensity(Lum);
+			GAuthoredLights.Emplace(Base, Authored);
+			// SHADOWS OFF regardless of the authored flag. Half of a map's
+			// lights ask for shadows, and a few thousand shadow-casting
+			// dynamic lights is not a preview, it is a slideshow. The flag is
+			// decoded and kept in the core for whoever wants it.
+			Base->SetCastShadows(false);
+			Base->SetMobility(EComponentMobility::Movable);
+			Base->SetVisibility(GLayers[(int32)ELayer::Lighting].bOn, false);
+			Made++;
+		}
+		if (SkippedDark > 0)
+		{
+			UE_LOG(LogBF6HighPoly, Log,
+				TEXT("lights: %d skipped for zero intensity or zero reach"), SkippedDark);
+		}
+		if (Made > 0)
+		{
+			// The DISTRIBUTION, not just the count that got clipped. A ceiling
+			// is only a judgement call while nobody has looked at what it is
+			// cutting, and this is the one number that says whether 50,000 is
+			// throwing away a long tail or half the map.
+			UE_LOG(LogBF6HighPoly, Log,
+				TEXT("lights: %.0f lm mean, %.0f lm max authored, %d in luminance ")
+				TEXT("units converted to power"),
+				SumLm / Made, MaxLm, Luminance);
+		}
+		if (Clamped > 0)
+		{
+			UE_LOG(LogBF6HighPoly, Log,
+				TEXT("lights: %d of %d clamped to %.0f lm - move it live with ")
+				TEXT("BF6.HighPoly.LightMax"),
+				Clamped, Made + SkippedDark, GLightLumenMax);
+		}
+		return Made;
+	}
+
+	// The sun, sky and fog, from the level's own VisualEnvironment.
+	void ApplyEnvironment(AActor* A, USceneComponent* Root,
+	                      const BF6HP::FCore::FVELighting& V)
+	{
+		if (!GEditor) return;
+		// Set from the sun below, and reused by the sky so the two keep the
+		// ratio the fleet was measured to author.
+		float SunLuxToEditor = 2.5e-5f;
+		UWorld* W = GEditor->GetEditorWorldContext().World();
+		if (!W) return;
+
+		if (V.bHasSun)
+		{
+			// THE SUN IS THE TOOL'S, not ours, so it is adjusted rather than
+			// replaced: spawning a second directional light would double every
+			// shadow in the map.
+			ADirectionalLight* Sun = nullptr;
+			for (TActorIterator<ADirectionalLight> It(W); It; ++It) { Sun = *It; break; }
+			if (Sun)
+			{
+				// Bearing 0 points along game +Z, which is Unreal +Y, and turns
+				// toward +X. Elevation is above the horizon. This is the
+				// direction TO the sun; the light shines the other way.
+				const float Az = FMath::DegreesToRadians(V.SunBearingDeg);
+				const float El = FMath::DegreesToRadians(V.SunElevationDeg);
+				const FVector ToSun(FMath::Cos(El) * FMath::Sin(Az),
+				                    FMath::Cos(El) * FMath::Cos(Az),
+				                    FMath::Sin(El));
+				Sun->SetActorRotation(FRotationMatrix::MakeFromX(-ToSun).Rotator());
+				if (ULightComponent* LC = Sun->GetLightComponent())
+				{
+					LC->SetLightColor(V.SunColor, /*bSRGB*/ false);
+					if (UDirectionalLightComponent* D = Cast<UDirectionalLightComponent>(LC))
+					{
+						// AUTHORED LUX IS NOT AN EDITOR INTENSITY.
+						//
+						// Unreal's directional light nominally takes lux, and
+						// feeding it the authored value directly is what turned
+						// Tsuru Reef into a white screen: 139,610 lux is
+						// physically correct tropical daylight, the GAME meters
+						// it at runtime, and an editor viewport does not. A
+						// post-process volume with automatic exposure was not
+						// enough on its own.
+						//
+						// So the same curve the Godot plugin settled on, for
+						// the same stated reason ("the game auto-exposes, the
+						// editor doesn't, so absolute lux can't be used
+						// directly"), rescaled to this editor's working range -
+						// the tool's own hard-coded sun sat at 3. Full midday
+						// near 120,000 lux lands on a strong sun, a dim canal
+						// stays dim, and the RELATIVE difference between maps
+						// survives, which is the part that carries the look.
+						const float Lux = FMath::Max(0.f, V.SunIntensityLux);
+						const float Rel = Lux < 10.f
+							? 0.3f
+							: FMath::Clamp(3.0f * FMath::Pow(Lux / 120000.f, 0.45f), 0.3f, 8.f);
+						D->SetIntensity(Rel);
+						// KEPT, so the sky can use the SAME factor.
+						//
+						// The sun's authored lux is squeezed into the editor's
+						// working range by the curve above. If the sky were
+						// scaled by anything else, the measured relationship
+						// between them would be destroyed - and that
+						// relationship is the one thing about sky brightness
+						// that has actually been measured: integrating all 15
+						// shipped panoramas over their domes and multiplying by
+						// the authored LuminanceScale puts the sky's own
+						// illuminance at 0.09 to 0.30 of the level's SunIntensity,
+						// median 0.19, against a shuffled-pairing control that
+						// scored 0 of 400. Reusing this factor preserves that
+						// ratio by construction and introduces no new constant.
+						if (Lux > 1.f) SunLuxToEditor = Rel / Lux;
+						D->LightSourceAngle = FMath::Max(0.f, V.SunAngularRadiusDeg * 2.f);
+						UE_LOG(LogBF6HighPoly, Log,
+							TEXT("lighting: sun %.0f lux authored -> %.2f editor intensity"),
+							Lux, Rel);
+					}
+					LC->SetMobility(EComponentMobility::Movable);
+					LC->MarkRenderStateDirty();
+				}
+				UE_LOG(LogBF6HighPoly, Log,
+					TEXT("lighting: preset %s, sun bearing %.1f deg, elevation %.1f deg, ")
+					TEXT("%.0f lux, colour (%.3f %.3f %.3f)"),
+					*V.Preset, V.SunBearingDeg, V.SunElevationDeg, V.SunIntensityLux,
+					V.SunColor.R, V.SunColor.G, V.SunColor.B);
+			}
+			else
+			{
+				UE_LOG(LogBF6HighPoly, Warning,
+					TEXT("lighting: no directional light in the map to carry the sun"));
+			}
+		}
+
+		// THE LEVEL'S OWN SKY, drawn as a dome around the world.
+		//
+		// A sphere rather than a cubemap because the panorama is
+		// equirectangular and Unreal's sky light will not take a 2D texture.
+		// Its radius is the level's own furthest placement plus a quarter,
+		// floored at 40 km: MP_Isolated's far world reaches 135 km, so a fixed
+		// 40 km dome would sit inside its volcano, its ocean-horizon plane and
+		// two of its backdrop tiles. The material is unlit and flagged as sky,
+		// so it costs nothing and occludes nothing.
+		UTexture2D* PanoTex = (V.PanoramaTexture >= 0) ? TextureFor(V.PanoramaTexture) : nullptr;
+		if (V.PanoramaTexture >= 0 && !PanoTex)
+		{
+			// NOT the same as a level with no sky, and it must not be reported
+			// as one. The panorama is BC6H, which is the only HDR format this
+			// tool uploads, so a failure here is a format problem rather than a
+			// missing asset.
+			UE_LOG(LogBF6HighPoly, Warning,
+				TEXT("sky: this level authors panorama texture %d but it did not ")
+				TEXT("decode, so the sky falls back to a procedural atmosphere"),
+				V.PanoramaTexture);
+		}
+		if (PanoTex)
+		{
+			UMaterial* SkyParent = EnsureSkyMaterial();
+			UStaticMesh* Sphere = LoadObject<UStaticMesh>(
+				nullptr, TEXT("/Engine/BasicShapes/Sphere.Sphere"));
+			if (SkyParent && Sphere)
+			{
+				UStaticMeshComponent* SC = NewObject<UStaticMeshComponent>(
+					A, TEXT("Light_SkyDome"), RF_Transient);
+				if (SC)
+				{
+					SC->SetupAttachment(Root);
+					// REGISTERED BEFORE IT IS PLACED. A world transform set on
+					// an unregistered component has no scene proxy to move and
+					// does not reliably survive registration, which is the
+					// pattern every other component in this file follows.
+					SC->RegisterComponent();
+					SC->SetStaticMesh(Sphere);
+					// The engine sphere is 100 cm across, so its radius is 50.
+					//
+					// SIZED FROM THE LEVEL, NOT FROM A CONSTANT. 40 km was
+					// picked when the authored backdrop was believed to stop
+					// at 36.8 km. MP_Isolated's does not: its ocean-horizon
+					// sheet becomes a 192 km plane, one backdrop tile is
+					// re-placed at 4.06x out to 98 km, and its volcano reaches
+					// 135 km. A 40 km dome sits INSIDE all three, so the sky
+					// would be drawn in front of the scenery.
+					const double DomeCm =
+						FMath::Max((double)GFarWorldRadiusCm * 1.25, 4000000.0);
+					SC->SetWorldScale3D(FVector(DomeCm / 50.0));
+					SC->SetCastShadow(false);
+					SC->bAffectDistanceFieldLighting = false;
+					SC->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+					SC->SetMobility(EComponentMobility::Movable);
+					UMaterialInstanceDynamic* MID =
+						UMaterialInstanceDynamic::Create(SkyParent, SC);
+					if (MID)
+					{
+						MID->SetFlags(RF_Transient);
+						MID->SetTextureParameterValue(TEXT("Panorama"), PanoTex);
+						MID->SetScalarParameterValue(TEXT("SkyRotationTurns"),
+							V.SkyPanoramicRotationTurns);
+						// THE SAME FACTOR THE SUN USED. See the sun block.
+						const float Emissive =
+							FMath::Max(0.f, V.SkyLuminanceScale) * SunLuxToEditor;
+						MID->SetScalarParameterValue(TEXT("SkyEmissiveScale"), Emissive);
+						SC->SetMaterial(0, MID);
+						UE_LOG(LogBF6HighPoly, Log,
+							TEXT("sky: panorama drawn, luminance scale %.0f -> emissive ")
+							TEXT("%.4g, rotation %.3f turns"),
+							V.SkyLuminanceScale, Emissive, V.SkyPanoramicRotationTurns);
+					}
+					SC->SetVisibility(GLayers[(int32)ELayer::Lighting].bOn, false);
+				}
+			}
+			else if (!Sphere)
+			{
+				UE_LOG(LogBF6HighPoly, Warning,
+					TEXT("sky: /Engine/BasicShapes/Sphere is not loadable, so the ")
+					TEXT("panorama has nothing to draw on"));
+			}
+		}
+		else if (V.PanoramaTexture < 0)
+		{
+			UE_LOG(LogBF6HighPoly, Log,
+				TEXT("sky: this level ships no panorama, falling back to a ")
+				TEXT("procedural atmosphere"));
+		}
+
+		// AN ATMOSPHERE ONLY WHERE THERE IS NO PAINTED SKY.
+		//
+		// The previous rule kept the atmosphere on SkyType 2 as well, on the
+		// belief that exactly one level was Physical and that there the
+		// atmosphere WAS the sky. Both halves were wrong.
+		//
+		// TEN shipped levels read SkyType 2, not one: MP_Isolated, MP_Granite,
+		// its seven Portal cuts and MP_Portal_Sand. SunScale on the sky
+		// component is 1.0 on all ten and on none of the eighteen procedural
+		// levels, which is the same switch read a second way.
+		//
+		// And a physical level still ships a COMPLETE PAINTED SKY. Both
+		// physical panoramas carry their own blue and their own horizon haze,
+		// both are rotation aligned to within a degree of the authored sun,
+		// and both are luminance calibrated so the sheet ALONE delivers 0.102
+		// and 0.073 of the level's SunIntensity - the same relationship the
+		// procedural fleet authors. MP_Isolated's PanoramicAlphaTexture reads
+		// 0.92 to 1.00 across the entire sheet, so its dome is the painted sky
+		// under any reading of that mask. Drawing a full Rayleigh sky
+		// underneath pays for the blue and the ambient twice.
+		//
+		// What SkyType 2 actually buys is AERIAL PERSPECTIVE over distance
+		// geometry - AerialPerspectiveIntensity is 150 on MP_Isolated and 50
+		// on Granite against 0 on fifteen of the eighteen procedural levels -
+		// and that is a haze over the far world, not a second sky.
+		const bool bWantAtmosphere = (PanoTex == nullptr);
+		if (bWantAtmosphere)
+		{
+			if (USkyAtmosphereComponent* Atm =
+				NewObject<USkyAtmosphereComponent>(A, TEXT("Light_SkyAtmosphere"), RF_Transient))
+			{
+				Atm->SetupAttachment(Root);
+				Atm->RegisterComponent();
+				if (V.MieCoefficient > 0.f) Atm->MieScatteringScale = V.MieCoefficient;
+				if (V.MieG != 0.f) Atm->MieAnisotropy = FMath::Clamp(V.MieG, -0.99f, 0.99f);
+				Atm->SetVisibility(GLayers[(int32)ELayer::Lighting].bOn, false);
+			}
+		}
+		// EXPOSURE, which is the half of the environment that was missing.
+		//
+		// The VE authors real photometric units: Tsuru Reef's sun is 139,610
+		// lux, which is correct for tropical daylight and is meaningless
+		// without a camera response. The game meters it at runtime -
+		// `auto_exposure` is 1 on every shipped map - so the authored `ev` is
+		// the STARTING POINT of that loop, not a value to apply. Rendered raw,
+		// as it was until now, the screen goes white.
+		//
+		// So the same thing the game does: automatic exposure, over a range
+		// wide enough to swallow six orders of magnitude between a lit reef and
+		// an unlit interior, with the authored compensation applied on top.
+		{
+			UWorld* PW = GEditor->GetEditorWorldContext().World();
+			APostProcessVolume* PP = PW ? PW->SpawnActor<APostProcessVolume>() : nullptr;
+			if (PP)
+			{
+				PP->SetActorLabel(TEXT("Light_Exposure"));
+				PP->Tags.Add(FName(*(FString(TEXT("addon:")) + kAddonName)));
+				PP->SetFlags(RF_Transient);
+				PP->bUnbound = true;          // the whole world, not a box
+				FPostProcessSettings& S = PP->Settings;
+				S.bOverride_AutoExposureMethod = true;
+				S.AutoExposureMethod = V.bAutoExposure ? AEM_Histogram : AEM_Manual;
+				S.bOverride_AutoExposureMinBrightness = true;
+				S.bOverride_AutoExposureMaxBrightness = true;
+				// Wide on purpose. A clamped range is why a physically correct
+				// sun reads as white: the metering cannot reach it.
+				S.AutoExposureMinBrightness = -8.f;
+				S.AutoExposureMaxBrightness = 20.f;
+				S.bOverride_AutoExposureBias = true;
+				S.AutoExposureBias = V.ExposureCompensation;
+				S.bOverride_AutoExposureSpeedUp = true;
+				S.bOverride_AutoExposureSpeedDown = true;
+				S.AutoExposureSpeedUp = 3.f;
+				S.AutoExposureSpeedDown = 1.f;
+				UE_LOG(LogBF6HighPoly, Log,
+					TEXT("lighting: exposure %s, authored ev %.2f (max %.2f), compensation %.2f"),
+					V.bAutoExposure ? TEXT("automatic") : TEXT("manual"),
+					V.ExposureEV, V.ExposureEVMax, V.ExposureCompensation);
+			}
+			else
+			{
+				UE_LOG(LogBF6HighPoly, Warning,
+					TEXT("lighting: no post process volume, so the sun's real ")
+					TEXT("photometric intensity will read as white"));
+			}
+		}
+
+		if (USkyLightComponent* Sky =
+			NewObject<USkyLightComponent>(A, TEXT("Light_SkyLight"), RF_Transient))
+		{
+			Sky->SetupAttachment(Root);
+			Sky->Mobility = EComponentMobility::Movable;
+			Sky->bRealTimeCapture = true;
+			Sky->SourceType = SLS_CapturedScene;
+			// NOT the authored SkyLuminanceScale. That number is in the game's
+			// physical HDR units, the same units that make the sun 139,610 lux
+			// on Tsuru Reef, and multiplying a real-time capture by it blows
+			// the frame to white. The capture already carries the atmosphere's
+			// own brightness; this is a unit multiplier on top of it, so it
+			// stays at one and EXPOSURE does the work.
+			Sky->Intensity = 1.f;
+			Sky->RegisterComponent();
+			Sky->SetVisibility(GLayers[(int32)ELayer::Lighting].bOn, false);
+		}
 	}
 
 	int32 GWaterBuilt = 0;
@@ -1971,6 +4413,17 @@ namespace
 			const BF6HP::FCore::FWater& S = W[wi];
 			const float SizeM = (float)FMath::Max(S.Size.X, S.Size.Y);
 			FWaveSet Waves = bHaveSim ? DeriveWaves(Sim, S.bOcean, SizeM) : FWaveSet();
+			// The sea state, said out loud. Wave height is the one water number
+			// a person can judge by eye against the real game, so the inputs
+			// and the result belong in the log rather than in a guess.
+			if (bHaveSim)
+			{
+				UE_LOG(LogBF6HighPoly, Log,
+					TEXT("water waves: wind speed %.4f, choppiness %.3f, tile %.2f m ")
+					TEXT("-> amplitude %.3f m, chop %.2f, base wavelength %.1f m"),
+					Sim.WindSpeed, Sim.Choppiness, Sim.TileDimension,
+					Waves.Gain, Waves.Chop, Waves.BaseLen);
+			}
 			// A GRID DENSE ENOUGH TO DISPLACE. The Gerstner offset moves
 			// vertices, so vertex spacing is the wave resolution: 12 m steps
 			// give the ratio-1 swell (26-34 m) three-plus vertices per length,
@@ -2139,7 +4592,8 @@ namespace
 			? (double)T.HeightScale / 65536.0
 			: FMath::Max(0.001, T.WorldMax.Y - T.WorldMin.Y) / 65535.0;
 
-		GRoadRecords = GRoadTris = GRoadElevated = 0;
+		GRoadRecords = GRoadTris = GRoadElevated = GRoadColourless = GRoadPainted = 0;
+		GRoadTintClamped = 0;
 
 		// One mesh per record. A record is one road segment or one painted
 		// area, each with its own sheets, so merging them would mean one
@@ -2149,6 +4603,49 @@ namespace
 			const BF6HP::FCore::FDecal& d = D[di];
 			const int32 nv = d.VertexCount;
 			if (nv < 3 || nv % 3 != 0) continue;
+
+			// A DECAL WITH NO COLOUR IS NOT A WHITE DECAL.
+			//
+			// Measured on MP_Isolated: of 1,435 records, 1,026 bind a colour
+			// sheet and 409 bind none at all. Those 409 still carry coverage,
+			// normal and ambient occlusion, because they MODULATE the ground
+			// rather than paint it - potholes, wear, dirt darkening. Binding
+			// nothing left the material's BaseColor at the parent default,
+			// which is white, so every one of them drew as a bright white
+			// plane lying on the terrain.
+			//
+			// A RECORD WITH NO COLOUR SHEET IS THREE DIFFERENT THINGS, and
+			// only one of them is nothing.
+			//
+			// Measured over every shipped decal resource: of the records that
+			// bind no colour sheet, well over half carry an authored COLOUR
+			// CONSTANT alongside a coverage mask. Those are road paint, text
+			// and arrows, and the constant is the colour itself rather than a
+			// multiplier - on the two levels checked here only 3.1% and 5.2%
+			// of them push a channel past 1.0, against 24% and 82% for the
+			// records that do have a sheet. The rest are puddles and wetness,
+			// which carry no colour at all, and a small tail of true
+			// modulators carrying a mask plus a normal plus occlusion.
+			//
+			// Dropping all of them lost the paint. Binding them through a
+			// sampler that falls back to white drew white planes, which is why
+			// they were dropped in the first place. Painting the mask in the
+			// authored colour is what the record actually says.
+			if (d.Albedo < 0)
+			{
+				if (d.bHasTint || d.bHasTint2)
+				{
+					GRoadPainted++;          // colour is a constant: draw it
+				}
+				else
+				{
+					// No colour anywhere. Puddles and modulators need a decal
+					// material that writes normal and roughness without
+					// touching albedo, which is a separate piece of work.
+					GRoadColourless++;
+					continue;
+				}
+			}
 
 			// IS THIS RECORD ACTUALLY OFF THE GROUND?
 			//
@@ -2224,10 +4721,23 @@ namespace
 					VCol.Set(vi, 0, FVector4f(p[4], p[5], p[6], p[7]));
 					return vi;
 				};
-				// Wound to face up after the axis swap, the same reversal the
-				// ground and the props take.
+				// FACE UP. Observed upside down: visible from underneath and
+				// invisible from above, which is a face pointing at the
+				// ground.
+				//
+				// The reasoning that put a reversal here is sound in general -
+				// mapping game (x, y, z) to Unreal (x, z, y) swaps two axes,
+				// flips handedness and so flips winding - but the decal
+				// vertices do not arrive in the same order a mesh's do, so
+				// applying it here reversed something that was already
+				// correct. Two reversals is none.
+				//
+				// Winding, not a two-sided material: a two-sided fix would
+				// make them visible again while leaving every normal pointing
+				// down, so they would light as though the sun were under the
+				// map.
 				MD.CreatePolygon(Group, TArray<FVertexInstanceID>{
-					Corner(t), Corner(t + 2), Corner(t + 1) });
+					Corner(t), Corner(t + 1), Corner(t + 2) });
 			}
 
 			FStaticMeshOperations::ComputeTriangleTangentsAndNormals(MD);
@@ -2259,6 +4769,22 @@ namespace
 			GBuiltAnything = true;
 			GRoadTris += nv / 3;
 		}
+		if (GRoadTintClamped > 0)
+		{
+			UE_LOG(LogBF6HighPoly, Log,
+				TEXT("decals: %d record(s) had an authored tint above 1.0 over a ")
+				TEXT("colour sheet and were clamped - unclamped they saturate to ")
+				TEXT("white, which is what the carrier decks were doing"),
+				GRoadTintClamped);
+		}
+		if (GRoadPainted > 0 || GRoadColourless > 0)
+		{
+			UE_LOG(LogBF6HighPoly, Log,
+				TEXT("decals: %d record(s) painted from an authored colour ")
+				TEXT("constant, %d still skipped (no colour anywhere - puddles ")
+				TEXT("and modulators, which need a decal material)"),
+				GRoadPainted, GRoadColourless);
+		}
 		return GRoadRecords;
 	}
 
@@ -2266,6 +4792,81 @@ namespace
 	// The map, built. One instanced component per distinct asset, which is both
 	// the fast way to draw it and the honest shape of the data: a handful of
 	// meshes placed over and over.
+	// ---- game modes -------------------------------------------------------
+	//
+	// A LEVEL SHIPS EVERY GAME MODE'S PROPS AT ONCE, AND THEY ARE MUTUALLY
+	// EXCLUSIVE.
+	//
+	// On MP_Isolated, 22,910 of 55,331 placements - 41.4% of the level - come
+	// from bundles under `_layers_gameplay/`, and the big ones are alternative
+	// layouts of the same ground: carrierstrike 15,033, portal_gameplay 3,005,
+	// conquest 2,453, escalation 1,102, portal_aircraftcarriers_conquest 1,100.
+	// The four largest share 85 assets and have ZERO placements in common at
+	// 1 cm, so building them together does not add detail, it stacks layouts.
+	// Counting carrier bridge parts over the level gives EIGHT carrier islands
+	// at eight distinct positions where the game shows two.
+	//
+	// The bundle string names the mode, so no new decode is needed. Everything
+	// outside `_layers_gameplay/` is shared art and is always built.
+	//
+	// Empty means "the biggest one", which is the map's headline mode and the
+	// closest thing to what a player sees. "all" restores the old behaviour.
+	FString GGameMode;
+
+
+	// WHAT THE LAST BUILD FOUND, so the panel can offer it. The modes are a
+	// property of the LEVEL, not of the tool, so there is nothing to show
+	// until a level has been read once.
+	TArray<TPair<FString, int32>> GModesFound;
+
+	// MESHES THAT BIND NO TEXTURE AND WOULD DRAW WHITE.
+	//
+	// These are real placements, not decode failures: the game draws them with
+	// a shader that needs no sheet, and our generic material falls back to a
+	// white default. Untextured they are the most visible thing on the map -
+	// bd_eas_oceanhorizon_01 is sixteen triangles placed at scale 75, which is
+	// a 192 KILOMETRE plane, and it sits at y 68 m, below the playable water.
+	// A white disc the size of the map is a far worse answer than no disc.
+	//
+	// The FX ones are smoke plumes, contrails and a cloud card: billboards
+	// whose look lives entirely in a shader we do not run yet. They belong to
+	// the FX path when it lands, not to the mesh path.
+	// Decal meshes: a quad whose whole job is the sheet stuck on it.
+	bool IsDecalPath(const FString& Mesh)
+	{
+		return Mesh.Contains(TEXT("/decals/"), ESearchCase::IgnoreCase)
+		    || Mesh.Contains(TEXT("/decal/"), ESearchCase::IgnoreCase);
+	}
+	int32 GDecalSectionsDropped = 0, GDecalMeshesDropped = 0;
+
+	bool DrawsWhiteWithNoSheet(const FString& Mesh)
+	{
+		static const TCHAR* kNoSheet[] = {
+			TEXT("bd_eas_oceanhorizon_01"),
+			TEXT("ob_fx_bd_vertical_smokeplume_05"),
+			TEXT("ob_fx_bd_horizontal_smokeplumes_01"),
+			TEXT("fxm_contrails_strip"),
+			TEXT("vfx_sky_cloudcard_01"),
+		};
+		for (const TCHAR* N : kNoSheet)
+			if (Mesh.Contains(N, ESearchCase::IgnoreCase)) return true;
+		return false;
+	}
+
+	// The segment after _layers_gameplay/, or empty when the bundle is not a
+	// gameplay layer. "conquest/conquest" collapses to "conquest".
+	FString GameModeOf(const FString& Bundle)
+	{
+		static const FString Marker(TEXT("_layers_gameplay/"));
+		const int32 At = Bundle.Find(Marker, ESearchCase::IgnoreCase,
+		                             ESearchDir::FromEnd);
+		if (At == INDEX_NONE) return FString();
+		FString Rest = Bundle.Mid(At + Marker.Len());
+		int32 Slash = INDEX_NONE;
+		if (Rest.FindChar(TEXT('/'), Slash)) Rest = Rest.Left(Slash);
+		return Rest;
+	}
+
 	int32 BuildLevelGeometry(const TArray<BF6HP::FPlacement>& P, int32& OutMeshes, int32& OutFailed,
 	                         FScopedSlowTask* Task)
 	{
@@ -2289,10 +4890,103 @@ namespace
 			FString Mesh, Bundle, Variation;
 			TArray<const BF6HP::FPlacement*> Rows;
 		};
+		// WHICH MODE ARE WE BUILDING. Counted first, because the default is
+		// "the biggest", and because the list is worth printing either way -
+		// a user who wants Conquest cannot ask for it if nothing ever said
+		// Conquest was there.
+		TMap<FString, int32> ModeCount;
+		GFarWorldRadiusCm = 0.f;
+		for (const BF6HP::FPlacement& p : P)
+		{
+			const FString M = GameModeOf(p.Bundle);
+			if (!M.IsEmpty()) ModeCount.FindOrAdd(M)++;
+			// Origin is game metres, and a radius does not care about the
+			// basis swap.
+			GFarWorldRadiusCm = FMath::Max(GFarWorldRadiusCm,
+				(float)p.Origin.Size() * 100.f);
+		}
+		GModesFound.Reset();
+		for (const TPair<FString, int32>& kv : ModeCount) GModesFound.Add(kv);
+		GModesFound.Sort([](const TPair<FString, int32>& A, const TPair<FString, int32>& B)
+			{ return A.Value > B.Value; });
+
+		FString Chosen = GGameMode;
+		if (Chosen.IsEmpty())
+		{
+			int32 Best = -1;
+			for (const TPair<FString, int32>& kv : ModeCount)
+				if (kv.Value > Best) { Best = kv.Value; Chosen = kv.Key; }
+		}
+		const bool bAllModes = Chosen.Equals(TEXT("all"), ESearchCase::IgnoreCase);
+		if (ModeCount.Num() > 0)
+		{
+			ModeCount.ValueSort([](int32 A, int32 B) { return A > B; });
+			FString List;
+			int32 Shown = 0, Total = 0;
+			for (const TPair<FString, int32>& kv : ModeCount)
+			{
+				Total += kv.Value;
+				if (Shown++ < 6)
+					List += FString::Printf(TEXT("%s%s %d"),
+						List.IsEmpty() ? TEXT("") : TEXT(", "), *kv.Key, kv.Value);
+			}
+			UE_LOG(LogBF6HighPoly, Log,
+				TEXT("game modes: %d found carrying %d placement(s) (%.1f%% of the ")
+				TEXT("level) - %s%s"),
+				ModeCount.Num(), Total, P.Num() ? 100.f * Total / P.Num() : 0.f,
+				*List, ModeCount.Num() > 6 ? TEXT(", ...") : TEXT(""));
+			UE_LOG(LogBF6HighPoly, Log,
+				TEXT("game modes: building %s. They are ALTERNATIVE layouts of the ")
+				TEXT("same ground, not extra detail - switch with ")
+				TEXT("BF6.HighPoly.GameMode <name|all>"),
+				bAllModes ? TEXT("ALL of them, which stacks them on top of each other")
+				          : *Chosen);
+		}
+
 		TMap<FString, FGroup> ByMesh;
+		int32 ModeSkipped = 0;
+		int32 WhiteSkipped = 0;
+		GDecalSectionsDropped = GDecalMeshesDropped = 0;
+		ON_SCOPE_EXIT
+		{
+			if (ModeSkipped > 0)
+			{
+				UE_LOG(LogBF6HighPoly, Log,
+					TEXT("game modes: %d placement(s) skipped as belonging to a ")
+					TEXT("mode other than the one being built"), ModeSkipped);
+			}
+			if (GDecalSectionsDropped > 0 || GDecalMeshesDropped > 0)
+			{
+				UE_LOG(LogBF6HighPoly, Log,
+					TEXT("decal meshes: %d section(s) dropped for binding no ")
+					TEXT("colour sheet, taking %d whole mesh(es) with them - a ")
+					TEXT("decal with no colour draws white, and in game it is ")
+					TEXT("simply not there"),
+					GDecalSectionsDropped, GDecalMeshesDropped);
+			}
+			if (WhiteSkipped > 0)
+			{
+				UE_LOG(LogBF6HighPoly, Log,
+					TEXT("far world: %d placement(s) skipped for binding no ")
+					TEXT("texture - they are shader-drawn backdrop and FX and ")
+					TEXT("would render as white geometry, one of them a 192 km plane"),
+					WhiteSkipped);
+			}
+		};
 		for (const BF6HP::FPlacement& p : P)
 		{
 			if (p.Mesh.IsEmpty()) continue;
+			if (DrawsWhiteWithNoSheet(p.Mesh)) { WhiteSkipped++; continue; }
+			// Shared art has no mode and is always built.
+			if (!bAllModes)
+			{
+				const FString M = GameModeOf(p.Bundle);
+				if (!M.IsEmpty() && !M.Equals(Chosen, ESearchCase::IgnoreCase))
+				{
+					ModeSkipped++;
+					continue;
+				}
+			}
 			FString Key = p.Mesh;
 			FString Var;
 			if (!p.Variation.IsEmpty() &&
@@ -2402,6 +5096,7 @@ namespace
 				if (bHaveGround) Depths = &Ground;
 				else if (GCore.ReadTerrain(BF6Ext::CurrentLevel(), WaterGround))
 					Depths = &WaterGround;
+				GWaterCoeffs.Reset();
 				BuildWater(A, Root, Water, Pending, Depths);
 				UE_LOG(LogBF6HighPoly, Log, TEXT("water: %d surface(s)"), GWaterBuilt);
 			}
@@ -2411,6 +5106,38 @@ namespace
 				// backdrop instead. Neither is a failure of the build.
 				UE_LOG(LogBF6HighPoly, Log, TEXT("water: none for this level"));
 			}
+		}
+
+		if (GLayers[(int32)ELayer::Lighting].bOn)
+		{
+			if (Task) Task->EnterProgressFrame(1.f, LOCTEXT("Lighting", "Lighting the map"));
+			// The environment first: a sun with nothing to fill behind it is
+			// still better than the hard-coded one, and the sky light wants to
+			// exist before the local lights are judged against it.
+			BF6HP::FCore::FVELighting Env;
+			if (GCore.ReadLighting(BF6Ext::CurrentLevel(), Env))
+			{
+				ApplyEnvironment(A, Root, Env);
+			}
+			else
+			{
+				UE_LOG(LogBF6HighPoly, Warning, TEXT("lighting: %s"), *GCore.Error);
+			}
+
+			TArray<BF6HP::FCore::FLight> Lights;
+			FString Summary;
+			if (GCore.ReadLights(BF6Ext::CurrentLevel(), Lights, Summary))
+			{
+				const double T0 = FPlatformTime::Seconds();
+				GLightsBuilt = BuildLights(A, Root, Lights);
+				UE_LOG(LogBF6HighPoly, Log, TEXT("lights: %s, %d placed, %.1fs"),
+					*Summary, GLightsBuilt, FPlatformTime::Seconds() - T0);
+			}
+			else
+			{
+				UE_LOG(LogBF6HighPoly, Warning, TEXT("lights: %s"), *GCore.Error);
+			}
+			if (GLightsBuilt > 0) GBuiltAnything = true;
 		}
 
 		// DECODE SERIALLY, DESCRIBE IN PARALLEL, CREATE ON THE GAME THREAD.
@@ -2466,6 +5193,34 @@ namespace
 					OutFailed++;
 					continue;
 				}
+				// A DECAL WITH NO COLOUR SHEET IS INVISIBLE IN GAME, NOT WHITE.
+				//
+				// Decal meshes carry their colour through a slot this chain
+				// does not resolve - the materials are named M_Decal, M_Decals
+				// and M_CarrierFlightDeckDecal_01 - so their base colour falls
+				// back to the parent's white default and they draw as solid
+				// white quads. On MP_Isolated that is 770 instances over four
+				// meshes, and on a carrier deck it is a field of white squares
+				// at head height.
+				//
+				// Scoped to the decal PATH on purpose. The same census counts
+				// 4,349 unbound instances over 39 meshes that are NOT decals -
+				// floor plates, windows, signage - and those are real surfaces
+				// that should still draw, white or not, because absent
+				// geometry there would be a hole rather than a missing
+				// sticker.
+				if (IsDecalPath(G.Mesh))
+				{
+					const int32 Before = Sections.Num();
+					Sections.RemoveAll([](const BF6HP::FCore::FSection& S)
+					{
+						for (const BF6HP::FCore::FBinding& B : S.Textures)
+							if (B.Slot == 0 && B.Texture >= 0) return false;
+						return true;
+					});
+					GDecalSectionsDropped += Before - Sections.Num();
+					if (Sections.Num() == 0) { GDecalMeshesDropped++; continue; }
+				}
 				Decoded.Add(MoveTemp(Sections));
 				Names.Add(Order[i]);
 			}
@@ -2480,7 +5235,7 @@ namespace
 			Ok.Init(false, Decoded.Num());
 			ParallelFor(Decoded.Num(), [&](int32 i)
 			{
-				Ok[i] = DescribeMesh(Decoded[i], Descs[i], Tris[i]);
+	Ok[i] = DescribeMesh(Decoded[i], Descs[i], Tris[i]);
 			});
 			SecDescribe += FPlatformTime::Seconds() - T;
 
@@ -2699,6 +5454,78 @@ namespace
 
 	// Read the open map out of the game and mark every placement.
 	//
+	// THE LEVEL THE CACHES BELONG TO. Everything below is per map.
+	FString GBuiltLevel;
+
+	template <typename T>
+	void ReleaseRooted(T*& Ptr)
+	{
+		if (Ptr)
+		{
+			if (Ptr->IsRooted()) Ptr->RemoveFromRoot();
+			Ptr = nullptr;
+		}
+	}
+
+	// Drop everything that belongs to the map we are leaving.
+	//
+	// TWO BUGS, one visible and one not.
+	//
+	// GTextureCache is keyed by the CORE's texture id, and those ids are
+	// handed out per mount - id 42 on one map is a different sheet on the
+	// next. Worse, a texture the core refuses is cached as a NULL against its
+	// id, so every id that failed on the first map stayed permanently null on
+	// the second and the new map came up with no textures at all. That is the
+	// "it will not even try on a new map".
+	//
+	// And every raster below is AddToRoot'd, then overwritten by the next
+	// build without being released, so each map left its whole ground behind -
+	// two 4096 rasters, two 512 sheet arrays and their mip chains. That is
+	// hundreds of megabytes a map, never freed.
+	//
+	// What deliberately SURVIVES: the parent materials, the linear-white and
+	// mid-grey stand-ins, the default sheet array and the clay material. None
+	// of those carry map data, and rebuilding them would only cost shader
+	// compiles.
+	void ResetPerMapState()
+	{
+		// Not unrooted: these were never rooted. They stay alive through the
+		// material instances that reference them, and those go with the
+		// actors.
+		GTextureCache.Empty();
+
+		ReleaseRooted(GGroundAlbedo);
+		ReleaseRooted(GGroundFar);
+		ReleaseRooted(GGroundNormal);
+		ReleaseRooted(GCovIdxTex);
+		ReleaseRooted(GCovWTex);
+		ReleaseRooted(GCovParamTex);
+		ReleaseRooted(GCovColourTex);
+		ReleaseRooted(GSheetArray);
+		ReleaseRooted(GHeightArray);
+		ReleaseRooted(GWaterDepthTex);
+
+		GroundMat = nullptr;
+		GBuiltAnything = false;
+		GTexUploaded = GTexRefused = GMidsMade = GBindingsSeen = GBindingsBound = 0;
+		GRoadRecords = GRoadTris = GRoadElevated = GRoadColourless = GRoadPainted = 0;
+		GRoadTintClamped = 0;
+		GWaterBuilt = 0;
+		GLightsBuilt = 0;
+		GStatus.Reset();
+		GBuiltLevel.Reset();
+
+		// AND GIVE THE LOW-POLY MAP BACK.
+		//
+		// ApplyLowPoly hides the tool's own map whenever GHideLowPoly and
+		// GBuiltAnything are both set. GBuiltAnything used to survive a map
+		// load, so opening a second map left the tool convinced High Poly was
+		// built, hid that map's low-poly geometry, and showed nothing in its
+		// place. Clearing the flag is not enough on its own: the hide has
+		// already been applied to the new map and has to be undone.
+		ApplyLowPoly();
+	}
+
 	// SYNCHRONOUS, and it takes about half a minute the first time: mounting a
 	// level's archives and indexing every partition's guid is most of it, and
 	// both are cached in the core afterwards. Said out loud in the status line
@@ -2707,6 +5534,16 @@ namespace
 	{
 		const FString Level = BF6Ext::CurrentLevel();
 		if (Level.IsEmpty()) { GStatus = TEXT("no map open"); return; }
+
+		// A DIFFERENT MAP MEANS THE CACHES ARE LIES. See ResetPerMapState.
+		if (!GBuiltLevel.IsEmpty() && GBuiltLevel != Level)
+		{
+			UE_LOG(LogBF6HighPoly, Log,
+				TEXT("map changed %s -> %s, dropping the previous map's textures"),
+				*GBuiltLevel, *Level);
+			ResetPerMapState();
+		}
+		GBuiltLevel = Level;
 
 		const FString Install = EnsureInstall();
 		if (Install.IsEmpty())
@@ -2797,9 +5634,26 @@ namespace
 		ApplyLowPoly();
 		ApplyMode();
 		ApplyWind();
+		// "UNREADABLE" WAS THE WRONG WORD, and it read as a decode gap for
+		// months.
+		//
+		// A census over 28 levels that replays the reader's mesh path step by
+		// step and classifies every null it returns puts 11,486 of 11,486
+		// failed asset groups into ONE class: the graph walk emitted a row for
+		// something that has no mesh resource because it is NOT GEOMETRY.
+		// Every other way the path can fail is empty across the whole fleet -
+		// zero MeshSet parse failures, zero missing geometry chunks, zero
+		// sections lost in attribute decode.
+		//
+		// On MP_Badlands all 294 were named and opened: 89 FX effects, 38
+		// prefabs, 9 VisualEnvironment presets, 6 crater makers, 3 dynamic
+		// world logic prefabs, and the rest sound, UI, gamemode and layer
+		// partitions. One editor marker alone accounted for 419 of the missing
+		// placements. Nothing renderable is being lost here, so the number is
+		// reported as what it is.
 		GStatus = FString::Printf(TEXT("%d of %d placements, %d mesh(es)%s, %.0fs%s"),
 			GLastCount, P.Num(), Meshes,
-			Failed ? *FString::Printf(TEXT(", %d unreadable"), Failed) : TEXT(""),
+			Failed ? *FString::Printf(TEXT(", %d not geometry"), Failed) : TEXT(""),
 			BuildS, GNanite ? TEXT(" + nanite still building") : TEXT(""));
 		UE_LOG(LogBF6HighPoly, Log, TEXT("%s: %s"), *Level, *GStatus);
 		BF6Ext::Notify(FString::Printf(TEXT("High Poly: %s"), *GStatus));
@@ -2858,6 +5712,64 @@ namespace
 				ApplyLayer(L);
 			},
 			GLayers[i].Hint);
+	}
+
+	TSharedRef<SWidget> LayerPills()
+	{
+		TSharedRef<SWrapBox> Box = SNew(SWrapBox).UseAllottedSize(true);
+		for (int32 i = 0; i < (int32)ELayer::Count; i++)
+		{
+			Box->AddSlot()[ LayerPill((ELayer)i) ];
+		}
+		return Box;
+	}
+
+	// ONE PILL PER GAME MODE THE LEVEL ACTUALLY SHIPS.
+	//
+	// Not a fixed list, because the modes differ per map and a hard-coded set
+	// would be wrong on the next one. The counts are on the pill because they
+	// are the whole argument: a mode carrying fifteen thousand placements is a
+	// different proposition from one carrying four, and a creator cannot judge
+	// that without the number.
+	TSharedRef<SWidget> GameModePills()
+	{
+		TSharedRef<SWrapBox> Box = SNew(SWrapBox).UseAllottedSize(true);
+		if (GModesFound.Num() == 0)
+		{
+			Box->AddSlot()
+			[
+				SNew(STextBlock)
+				.Text(LOCTEXT("NoModesYet",
+					"Build once and the modes this map ships will appear here."))
+				.ColorAndOpacity(FSlateColor(FLinearColor(0.46f, 0.51f, 0.54f)))
+			];
+			return Box;
+		}
+		// "Largest" first: it is the default, and it is what a player sees.
+		Box->AddSlot()
+		[ Pill(TEXT("Largest"),
+			TAttribute<bool>::CreateLambda([]{ return GGameMode.IsEmpty(); }),
+			[]{ GGameMode.Reset(); },
+			TEXT("Build the mode with the most placements, which is the map's headline mode. Rebuild to apply.")) ]; 
+		for (const TPair<FString, int32>& M : GModesFound)
+		{
+			const FString Name = M.Key;
+			Box->AddSlot()
+			[ Pill(FString::Printf(TEXT("%s (%d)"), *Name, M.Value),
+				TAttribute<bool>::CreateLambda([Name]
+					{ return GGameMode.Equals(Name, ESearchCase::IgnoreCase); }),
+				[Name]{ GGameMode = Name; },
+				FString::Printf(TEXT("Build only this mode's props: %d placement(s). ")
+					TEXT("Rebuild to apply."), M.Value)) ];
+		}
+		Box->AddSlot()
+		[ Pill(TEXT("All"),
+			TAttribute<bool>::CreateLambda([]
+				{ return GGameMode.Equals(TEXT("all"), ESearchCase::IgnoreCase); }),
+			[]{ GGameMode = TEXT("all"); },
+			TEXT("Build every mode at once. They are ALTERNATIVE layouts of the same ")
+			TEXT("ground, so this stacks them - four carriers where the game shows one.")) ];
+		return Box;
 	}
 
 	TSharedRef<SWidget> ModePill(EMode M, const FString& Label, const FString& Hint)
@@ -3002,12 +5914,18 @@ namespace
 					[ CategoryLabel(LOCTEXT("Layers", "LAYERS")) ]
 					+ SVerticalBox::Slot().AutoHeight()
 					[
-						SNew(SWrapBox).UseAllottedSize(true)
-						+ SWrapBox::Slot()[ LayerPill(ELayer::Terrain) ]
-						+ SWrapBox::Slot()[ LayerPill(ELayer::Roads) ]
-						+ SWrapBox::Slot()[ LayerPill(ELayer::Objects) ]
-						+ SWrapBox::Slot()[ LayerPill(ELayer::Water) ]
+						// BUILT FROM THE ENUM, not listed by hand. These four
+						// used to be written out one per line, so adding a
+						// fifth layer to ELayer and to GLayers produced a layer
+						// that built, toggled and logged correctly and had no
+						// pill - which looks exactly like the feature not
+						// existing. A loop cannot forget one.
+						LayerPills()
 					]
+					+ SVerticalBox::Slot().AutoHeight().Padding(0, 6, 0, 4)
+					[ CategoryLabel(LOCTEXT("GameMode", "GAME MODE")) ]
+					+ SVerticalBox::Slot().AutoHeight()
+					[ GameModePills() ]
 					+ SVerticalBox::Slot().AutoHeight().Padding(0, 6, 0, 4)
 					[ CategoryLabel(LOCTEXT("Options", "OPTIONS")) ]
 					+ SVerticalBox::Slot().AutoHeight().Padding(0, 0, 0, 10)
@@ -3068,8 +5986,575 @@ namespace
 	}
 }
 
+// A material that will not compile draws as grey, and the only place that says
+// so is the log. This builds the ground material on demand and reports the
+// verdict, so the question can be settled without a map, an install, or a human
+// looking at a viewport:
+//
+//     UnrealEditor-Cmd.exe <uproject> -ExecCmds="BF6.HighPoly.CheckMaterials, quit"
+//                          -unattended -nosplash -stdout
+// LIVE TUNING, so a number can be found by looking rather than by rebuilding.
+//
+// Several of these values are CALIBRATIONS rather than decoded quantities - the
+// water clarity depth, the sun's editor intensity, the light lumen ceiling -
+// and the only way to settle a calibration is to look at it. Each rebuild
+// round trip costs minutes and the user's attention, so they are exposed as
+// console commands that walk the built material instances and set the
+// parameter in place.
+//
+//   BF6.HighPoly.WaterClarity 400     metres of depth before water is opaque
+//   BF6.HighPoly.SunIntensity 8       the directional light, directly
+//
+// WaterClarity is also the DIAGNOSTIC that settles whether the clarity ramp
+// works at all. Unreal's own water shading is
+//     Transmittance = exp(-ExtinctionCoeff * WaterVolumeDepth)
+// so driving the coefficients toward zero MUST make the surface clear. Set it
+// to something enormous: if the water goes transparent the ramp is wired and
+// only its distance is wrong, and if it does not then the coefficients are not
+// what is holding the water opaque and the fault is elsewhere - most likely
+// that nothing opaque is being rendered behind the surface for it to show.
+static void BF6_ForEachWaterMaterial(TFunctionRef<void(UMaterialInstanceDynamic*)> Fn)
+{
+    if (!GEditor) return;
+    UWorld* W = GEditor->GetEditorWorldContext().World();
+    if (!W) return;
+    const FName Owner(*(FString(TEXT("addon:")) + kAddonName));
+    for (TActorIterator<AActor> It(W); It; ++It)
+    {
+        if (!It->Tags.Contains(Owner)) continue;
+        TArray<UStaticMeshComponent*> Comps;
+        It->GetComponents<UStaticMeshComponent>(Comps);
+        for (UStaticMeshComponent* C : Comps)
+        {
+            if (!C || !C->GetName().StartsWith(TEXT("Water_"))) continue;
+            for (int32 mi = 0; mi < C->GetNumMaterials(); mi++)
+                if (UMaterialInstanceDynamic* MID =
+                        Cast<UMaterialInstanceDynamic>(C->GetMaterial(mi)))
+                    Fn(MID);
+        }
+    }
+}
+
+static void BF6_ForEachGroundMaterial(TFunctionRef<void(UMaterialInstanceDynamic*)> Fn)
+{
+    if (!GEditor) return;
+    UWorld* W = GEditor->GetEditorWorldContext().World();
+    if (!W) return;
+    const FName Owner(*(FString(TEXT("addon:")) + kAddonName));
+    for (TActorIterator<AActor> It(W); It; ++It)
+    {
+        if (!It->Tags.Contains(Owner)) continue;
+        TArray<UStaticMeshComponent*> Comps;
+        It->GetComponents<UStaticMeshComponent>(Comps);
+        for (UStaticMeshComponent* C : Comps)
+        {
+            if (!C || !C->GetName().StartsWith(TEXT("Terrain"))) continue;
+            for (int32 mi = 0; mi < C->GetNumMaterials(); mi++)
+                if (UMaterialInstanceDynamic* MID =
+                        Cast<UMaterialInstanceDynamic>(C->GetMaterial(mi)))
+                    Fn(MID);
+        }
+    }
+}
+
+static FAutoConsoleCommand GGroundDebugCmd(
+    TEXT("BF6.HighPoly.GroundDebug"),
+    TEXT("0 normal, 1 dominant layer as flat colour, 2 aerial map only, "
+         "3 near blend only, 4 far bake only, 5 layers per texel."),
+    FConsoleCommandWithArgsDelegate::CreateStatic([](const TArray<FString>& Args)
+    {
+        if (Args.Num() < 1) { UE_LOG(LogBF6HighPoly, Display,
+            TEXT("usage: BF6.HighPoly.GroundDebug <0-5>")); return; }
+        const float V = FCString::Atof(*Args[0]);
+        int32 n = 0;
+        BF6_ForEachGroundMaterial([&](UMaterialInstanceDynamic* MID)
+        { MID->SetScalarParameterValue(TEXT("DebugMode"), V); n++; });
+        UE_LOG(LogBF6HighPoly, Display,
+            TEXT("ground debug mode %.0f on %d material(s)"), V, n);
+    }));
+
+static FAutoConsoleCommand GGroundPhotoCmd(
+    TEXT("BF6.HighPoly.GroundPhoto"),
+    TEXT("0..1: how much of the ground colour comes from the level's aerial map "
+         "rather than the layer sheets. 0 is sheets only, 1 is the photograph "
+         "modulated by sheet detail."),
+    FConsoleCommandWithArgsDelegate::CreateStatic([](const TArray<FString>& Args)
+    {
+        if (Args.Num() < 1) { UE_LOG(LogBF6HighPoly, Display,
+            TEXT("usage: BF6.HighPoly.GroundPhoto <0..1>")); return; }
+        const float V = FCString::Atof(*Args[0]);
+        int32 n = 0;
+        BF6_ForEachGroundMaterial([&](UMaterialInstanceDynamic* MID)
+        { MID->SetScalarParameterValue(TEXT("PhotoMix"), V); n++; });
+        UE_LOG(LogBF6HighPoly, Display,
+            TEXT("ground photo mix %.2f on %d material(s)"), V, n);
+    }));
+
+static FAutoConsoleCommand GGroundBlendCmd(
+    TEXT("BF6.HighPoly.GroundBlend"),
+    TEXT("<near> <far> in metres: where the per-pixel blend gives way to the flattened bake."),
+    FConsoleCommandWithArgsDelegate::CreateStatic([](const TArray<FString>& Args)
+    {
+        if (Args.Num() < 2) { UE_LOG(LogBF6HighPoly, Display,
+            TEXT("usage: BF6.HighPoly.GroundBlend <near> <far>")); return; }
+        const float N = FCString::Atof(*Args[0]), F = FCString::Atof(*Args[1]);
+        int32 n = 0;
+        BF6_ForEachGroundMaterial([&](UMaterialInstanceDynamic* MID)
+        {
+            MID->SetScalarParameterValue(TEXT("BlendNear"), N);
+            MID->SetScalarParameterValue(TEXT("BlendFar"), F);
+            n++;
+        });
+        UE_LOG(LogBF6HighPoly, Display,
+            TEXT("ground blend %.0f to %.0f m on %d material(s)"), N, F, n);
+    }));
+
+// THE SKY, live.
+//
+// Two numbers here are not decoded and should be found by looking rather than
+// argued about. The ROTATION carries a half-turn seam constant: the panorama's
+// painted sun sits at u = 0.5, measured on five maps, and the sign convention
+// between the game's bearing and Unreal's axes is the part that could still be
+// half a turn out. MP_Aftermath is the map to check it on, because its painted
+// sun is a hard-edged disc at a low elevation, and it should land on the
+// authored bearing of 237.9 degrees.
+//
+// The BRIGHTNESS is derived rather than guessed - the sky reuses the sun's own
+// lux-to-editor factor, which preserves the measured 0.09 to 0.30 illuminance
+// ratio - but a scale on top of it costs nothing and settles any argument
+// about whether the derivation landed.
+static void BF6_ForEachSkyMaterial(TFunctionRef<void(UMaterialInstanceDynamic*)> Fn)
+{
+    if (!GEditor) return;
+    UWorld* W = GEditor->GetEditorWorldContext().World();
+    if (!W) return;
+    const FName Owner(*(FString(TEXT("addon:")) + kAddonName));
+    for (TActorIterator<AActor> It(W); It; ++It)
+    {
+        if (!It->Tags.Contains(Owner)) continue;
+        TArray<UStaticMeshComponent*> Comps;
+        It->GetComponents<UStaticMeshComponent>(Comps);
+        for (UStaticMeshComponent* C : Comps)
+        {
+            if (!C || !C->GetName().Contains(TEXT("SkyDome"))) continue;
+            for (int32 mi = 0; mi < C->GetNumMaterials(); mi++)
+                if (UMaterialInstanceDynamic* MID =
+                        Cast<UMaterialInstanceDynamic>(C->GetMaterial(mi)))
+                    Fn(MID);
+        }
+    }
+}
+
+static FAutoConsoleCommand GGameModeCmd(
+    TEXT("BF6.HighPoly.GameMode"),
+    TEXT("Which game mode's props to build: a mode name, or \"all\" to stack every "
+         "mode the way it used to, or empty to go back to the largest. They are "
+         "ALTERNATIVE layouts of the same ground, so building them all draws four "
+         "carriers where the game shows one. Rebuild the map to apply."),
+    FConsoleCommandWithArgsDelegate::CreateStatic([](const TArray<FString>& Args)
+    {
+        if (Args.Num() < 1)
+        {
+            UE_LOG(LogBF6HighPoly, Display,
+                TEXT("usage: BF6.HighPoly.GameMode <name|all>  (current \"%s\")"),
+                GGameMode.IsEmpty() ? TEXT("(largest)") : *GGameMode);
+            return;
+        }
+        GGameMode = Args[0].Equals(TEXT("default"), ESearchCase::IgnoreCase)
+            ? FString() : Args[0];
+        UE_LOG(LogBF6HighPoly, Display,
+            TEXT("game mode set to \"%s\" - rebuild the map to apply it"),
+            GGameMode.IsEmpty() ? TEXT("(largest)") : *GGameMode);
+    }));
+
+static FAutoConsoleCommand GSkyCmd(
+    TEXT("BF6.HighPoly.Sky"),
+    TEXT("0 or 1: show the level's painted sky dome. It rides on the Lighting "
+         "layer otherwise, and turning that off to hide the sky would take every "
+         "lamp in the map with it."),
+    FConsoleCommandWithArgsDelegate::CreateStatic([](const TArray<FString>& Args)
+    {
+        if (Args.Num() < 1 || !GEditor) { UE_LOG(LogBF6HighPoly, Display,
+            TEXT("usage: BF6.HighPoly.Sky <0|1>")); return; }
+        const bool bOn = FCString::Atoi(*Args[0]) != 0;
+        UWorld* W = GEditor->GetEditorWorldContext().World();
+        if (!W) return;
+        const FName Owner(*(FString(TEXT("addon:")) + kAddonName));
+        int32 n = 0;
+        for (TActorIterator<AActor> It(W); It; ++It)
+        {
+            if (!It->Tags.Contains(Owner)) continue;
+            TArray<UStaticMeshComponent*> Comps;
+            It->GetComponents<UStaticMeshComponent>(Comps);
+            for (UStaticMeshComponent* C : Comps)
+                if (C && C->GetName().Contains(TEXT("SkyDome")))
+                { C->SetVisibility(bOn, false); n++; }
+        }
+        UE_LOG(LogBF6HighPoly, Display,
+            TEXT("sky dome %s on %d component(s)"), bOn ? TEXT("on") : TEXT("off"), n);
+    }));
+
+static FAutoConsoleCommand GSkyRotationCmd(
+    TEXT("BF6.HighPoly.SkyRotation"),
+    TEXT("Sky panorama rotation in TURNS, not degrees. The authored value is "
+         "applied automatically; this overrides it. Add or subtract 0.5 to test "
+         "the seam convention - on MP_Aftermath the painted sun should sit at "
+         "bearing 237.9."),
+    FConsoleCommandWithArgsDelegate::CreateStatic([](const TArray<FString>& Args)
+    {
+        if (Args.Num() < 1) { UE_LOG(LogBF6HighPoly, Display,
+            TEXT("usage: BF6.HighPoly.SkyRotation <turns>")); return; }
+        const float V = FCString::Atof(*Args[0]);
+        int32 n = 0;
+        BF6_ForEachSkyMaterial([&](UMaterialInstanceDynamic* MID)
+        { MID->SetScalarParameterValue(TEXT("SkyRotationTurns"), V); n++; });
+        UE_LOG(LogBF6HighPoly, Display,
+            TEXT("sky rotation %.4f turns (%.1f deg) on %d material(s)"),
+            V, V * 360.f, n);
+    }));
+
+static FAutoConsoleCommand GSkyBrightnessCmd(
+    TEXT("BF6.HighPoly.SkyBrightness"),
+    TEXT("Emissive scale on the sky panorama. The automatic value reuses the "
+         "sun's own lux conversion, which holds the measured sky-to-sun "
+         "illuminance ratio of about 0.19."),
+    FConsoleCommandWithArgsDelegate::CreateStatic([](const TArray<FString>& Args)
+    {
+        if (Args.Num() < 1) { UE_LOG(LogBF6HighPoly, Display,
+            TEXT("usage: BF6.HighPoly.SkyBrightness <scale>")); return; }
+        const float V = FCString::Atof(*Args[0]);
+        int32 n = 0;
+        BF6_ForEachSkyMaterial([&](UMaterialInstanceDynamic* MID)
+        { MID->SetScalarParameterValue(TEXT("SkyEmissiveScale"), V); n++; });
+        UE_LOG(LogBF6HighPoly, Display,
+            TEXT("sky emissive scale %.5g on %d material(s)"), V, n);
+    }));
+
+static FAutoConsoleCommand GWaterFoamCoverageCmd(
+    TEXT("BF6.HighPoly.WaterFoamCoverage"),
+    TEXT("0..1: how much of the surface the foam covers. This is Unreal's water "
+         "Opacity, which is the coverage of the material ON TOP of the water - at "
+         "1 the water volume is switched off entirely. Set 0 for guaranteed clear "
+         "water; if that does not clear it, the fault is not in this material."),
+    FConsoleCommandWithArgsDelegate::CreateStatic([](const TArray<FString>& Args)
+    {
+        if (Args.Num() < 1) { UE_LOG(LogBF6HighPoly, Display,
+            TEXT("usage: BF6.HighPoly.WaterFoamCoverage <0..1>")); return; }
+        const float V = FCString::Atof(*Args[0]);
+        int32 n = 0;
+        BF6_ForEachWaterMaterial([&](UMaterialInstanceDynamic* MID)
+        { MID->SetScalarParameterValue(TEXT("FoamCoverage"), V); n++; });
+        UE_LOG(LogBF6HighPoly, Display,
+            TEXT("water foam coverage %.2f on %d material(s)"), V, n);
+    }));
+
+static FAutoConsoleCommand GWaterAlbedoCmd(
+    TEXT("BF6.HighPoly.WaterAlbedo"),
+    TEXT("0..1: how much of the WEAKEST channel's extinction is scattering rather "
+         "than absorption. Scattering is spectrally flat in clear water, so this is "
+         "one number for all three channels and the colour comes entirely from the "
+         "decoded extinction. Lower is deeper and more saturated, higher is brighter "
+         "and milkier. The only number in the water that is not decoded. Rebuild to "
+         "apply."),
+    FConsoleCommandWithArgsDelegate::CreateStatic([](const TArray<FString>& Args)
+    {
+        if (Args.Num() < 1) { UE_LOG(LogBF6HighPoly, Display,
+            TEXT("usage: BF6.HighPoly.WaterAlbedo <0..1>  (current %.2f)"),
+            GWaterAlbedoScale); return; }
+        GWaterAlbedoScale = FMath::Clamp(FCString::Atof(*Args[0]), 0.f, 1.f);
+        UE_LOG(LogBF6HighPoly, Display,
+            TEXT("water albedo scale %.2f - rebuild the map to apply it"),
+            GWaterAlbedoScale);
+    }));
+
+static FAutoConsoleCommand GWaterExtinctionCmd(
+    TEXT("BF6.HighPoly.WaterExtinction"),
+    TEXT("Scale on the mined extinction. How far you can see into water is "
+         "exp(-extinction * depth), so 0.5 doubles the visible depth and 2 halves "
+         "it. 1 is the value mined from the level."),
+    FConsoleCommandWithArgsDelegate::CreateStatic([](const TArray<FString>& Args)
+    {
+        if (Args.Num() < 1) { UE_LOG(LogBF6HighPoly, Display,
+            TEXT("usage: BF6.HighPoly.WaterExtinction <scale>")); return; }
+        const float K = FMath::Max(1e-4f, FCString::Atof(*Args[0]));
+        int32 n = 0;
+        float HalfM = 0.f;
+        for (const FWaterCoeff& C : GWaterCoeffs)
+        {
+            UMaterialInstanceDynamic* MID = C.MID.Get();
+            if (!MID) continue;
+            MID->SetVectorParameterValue(TEXT("Scattering"), C.Scatter * K);
+            MID->SetVectorParameterValue(TEXT("Absorption"), C.Absorb * K);
+            // Reported in metres, because a coefficient means nothing by eye
+            // and a half-transmittance depth means everything.
+            const float Ext = FMath::Max((C.Scatter.G + C.Absorb.G) * K, 1e-8f);
+            HalfM = 0.6931f / Ext * 0.01f;
+            n++;
+        }
+        UE_LOG(LogBF6HighPoly, Display,
+            TEXT("water extinction x%.3f on %d surface(s), green half-depth now %.2f m"),
+            K, n, HalfM);
+    }));
+
+static FAutoConsoleCommand GSunIntensityCmd(
+    TEXT("BF6.HighPoly.SunIntensity"),
+    TEXT("Set the directional light intensity directly, to find the value that reads right."),
+    FConsoleCommandWithArgsDelegate::CreateStatic([](const TArray<FString>& Args)
+    {
+        if (Args.Num() < 1 || !GEditor) { UE_LOG(LogBF6HighPoly, Display,
+            TEXT("usage: BF6.HighPoly.SunIntensity <value>")); return; }
+        const float V = FCString::Atof(*Args[0]);
+        UWorld* W = GEditor->GetEditorWorldContext().World();
+        if (!W) return;
+        int32 n = 0;
+        for (TActorIterator<ADirectionalLight> It(W); It; ++It)
+        {
+            if (ULightComponent* LC = It->GetLightComponent())
+            {
+                LC->SetIntensity(V);
+                LC->MarkRenderStateDirty();
+                n++;
+            }
+        }
+        UE_LOG(LogBF6HighPoly, Display,
+            TEXT("sun intensity set to %.2f on %d light(s)"), V, n);
+    }));
+
+// THE LOCAL LIGHT CEILING, live.
+//
+// The fleet authors up to 6e7 lumens, which is not a literal lamp, and the
+// conversion the game uses from an authored intensity to renderer energy is
+// not decoded. Until it is, the ceiling is a number somebody has to pick by
+// looking, and picking it should not cost a rebuild each time.
+//
+// Reported alongside is how many lights the new ceiling actually binds, since
+// a ceiling nothing reaches has no effect and a ceiling everything reaches has
+// flattened the map to one brightness. Both look like "it did nothing".
+static FAutoConsoleCommand GLightMaxCmd(
+    TEXT("BF6.HighPoly.LightMax"),
+    TEXT("Ceiling in lumens on the map's own lamps, re-applied to what is already "
+         "built. The authored values run to 6e7, so this is what stops a handful "
+         "of records washing out the map."),
+    FConsoleCommandWithArgsDelegate::CreateStatic([](const TArray<FString>& Args)
+    {
+        if (Args.Num() < 1) { UE_LOG(LogBF6HighPoly, Display,
+            TEXT("usage: BF6.HighPoly.LightMax <lumens>  (current %.0f)"),
+            GLightLumenMax); return; }
+        const float V = FMath::Max(0.f, FCString::Atof(*Args[0]));
+        GLightLumenMax = V;
+        int32 n = 0, Bound = 0, Gone = 0;
+        for (const TPair<TWeakObjectPtr<ULightComponent>, float>& P : GAuthoredLights)
+        {
+            ULightComponent* LC = P.Key.Get();
+            if (!LC) { Gone++; continue; }
+            const float Lum = FMath::Min(P.Value, V);
+            LC->SetIntensity(Lum);
+            LC->MarkRenderStateDirty();
+            if (P.Value > V) Bound++;
+            n++;
+        }
+        UE_LOG(LogBF6HighPoly, Display,
+            TEXT("light ceiling %.0f lm on %d light(s), %d of them bound by it%s"),
+            V, n, Bound,
+            Gone > 0 ? TEXT(" (some lights no longer exist, rebuild to refresh)")
+                     : TEXT(""));
+    }));
+
+static void BF6_CheckMaterials()
+{
+	{
+		// bRecompile: whether to FORCE the compile before judging.
+		//
+		// ONLY THE TWO GROUND MATERIALS. RecompileMaterial takes an access
+		// violation inside UnrealEditor-MaterialEditor on the others, which is
+		// what the comment on EnsureParentMaterial has warned about since it
+		// was first hit. Extending this check to all nine walked straight back
+		// into it: three headless runs died at the same instruction, and the
+		// water lines printed just before the crash came from
+		// EnsureWaterMaterial reporting itself as the ARGUMENT, not from the
+		// check having got that far.
+		//
+		// Everything else loses the forced compile and keeps the rest, which is
+		// where the value is anyway. The shading model, the blend mode and
+		// which pins are connected are all readable without asking for
+		// shaders, and those are what the water bug actually turned on.
+		auto Report = [](const TCHAR* Name, UMaterial* M, bool bRecompile = true)
+		{
+			if (!M || !IsValid(M))
+			{
+				UE_LOG(LogBF6HighPoly, Error, TEXT("CHECK %s: NOT BUILT"), Name);
+				return;
+			}
+
+			// FORCE THE COMPILE, then prove it happened.
+			//
+			// An empty error list is NOT a pass. Material shaders compile
+			// asynchronously, so reading GetCompileErrors on a material whose
+			// shaders have not been built yet returns nothing and reads as a
+			// clean bill of health. That is exactly what happened the first
+			// time this ran: two materials "COMPILED CLEAN" in 24 milliseconds
+			// with no shader compiler activity anywhere in the log. So the
+			// recompile is explicit, the wait is explicit, and the verdict
+			// reports the shader map and the elapsed time - a pass that took
+			// no time is a pass that did nothing.
+			const double T0 = FPlatformTime::Seconds();
+			if (bRecompile)
+			{
+				UMaterialEditingLibrary::RecompileMaterial(M);
+			}
+			// WAIT EITHER WAY, and this is what makes the unforced case worth
+			// reading. Building the material already called PostEditChange,
+			// which QUEUES a compile; the check used to read the resource
+			// before that finished and judge whatever shader map happened to
+			// be lying there. Waiting costs nothing and means a translation
+			// error actually lands in GetCompileErrors below.
+			//
+			// It is also the only force available for the materials
+			// RecompileMaterial crashes on, which is all of them except the
+			// two ground ones.
+			FAssetCompilingManager::Get().FinishAllCompilation();
+			const double Ms = (FPlatformTime::Seconds() - T0) * 1000.0;
+
+			const FMaterialResource* R = M->GetMaterialResource(GMaxRHIShaderPlatform);
+			if (!R)
+			{
+				UE_LOG(LogBF6HighPoly, Error, TEXT("CHECK %s: no material resource"), Name);
+				return;
+			}
+			const TArray<FString>& Errs = R->GetCompileErrors();
+			const bool bFinished = R->IsCompilationFinished();
+			const bool bHaveMap = R->GetGameThreadShaderMap() != nullptr;
+
+			// Said before the verdict, because a material that compiles
+			// cleanly as the WRONG shading model is the failure that looks
+			// most like success.
+			BF6_ReportMaterialState(Name, M);
+			if (Errs.Num() == 0)
+			{
+				if (!bRecompile && !bHaveMap)
+				{
+					// A PRESENT SHADER MAP IS NOT EVIDENCE HERE, and reporting
+					// it as one hid a real failure.
+					//
+					// This branch used to say COMPILED CLEAN whenever a shader
+					// map existed. The map can be a STALE one, built from the
+					// PREVIOUS version of the material, so a graph that no
+					// longer compiles still reports clean - which is exactly
+					// what happened to the road material after a Custom node
+					// gained an out-of-bounds swizzle. The engine failed it at
+					// LogShaderCompilers and this check called it clean in the
+					// same session.
+					//
+					// It is also incomplete by construction: the permutation
+					// that failed was a Lumen translucency pass, which nothing
+					// here would have asked for anyway.
+					UE_LOG(LogBF6HighPoly, Display,
+						TEXT("CHECK %s: graph built and readable, shaders NOT verified ")
+						TEXT("(no forced recompile; shader map %s may be stale). ")
+						TEXT("Search the log for 'Failed to compile Material' after a build."),
+						Name, bHaveMap ? TEXT("present") : TEXT("absent"));
+				}
+				else if (bHaveMap && bFinished)
+				{
+					UE_LOG(LogBF6HighPoly, Display,
+						TEXT("CHECK %s: COMPILED CLEAN (shader map present, %.0f ms)"), Name, Ms);
+				}
+				else
+				{
+					UE_LOG(LogBF6HighPoly, Warning,
+						TEXT("CHECK %s: no errors, but NOTHING WAS COMPILED ")
+						TEXT("(shader map %s, finished %s, %.0f ms) - this is not a pass"),
+						Name, bHaveMap ? TEXT("present") : TEXT("ABSENT"),
+						bFinished ? TEXT("yes") : TEXT("no"), Ms);
+				}
+				return;
+			}
+			UE_LOG(LogBF6HighPoly, Error, TEXT("CHECK %s: %d compile error(s)"), Name, Errs.Num());
+			for (const FString& E : Errs)
+			{
+				UE_LOG(LogBF6HighPoly, Error, TEXT("    %s"), *E);
+			}
+		};
+		// ALL OF THEM. This checked two materials out of nine, and water -
+		// the one that has been wrong for days - was not among them. A check
+		// with a hole in it is worse than no check, because the clean result
+		// it prints is read as covering everything.
+		Report(TEXT("ground blend"), EnsureGroundBlendMaterial());
+		Report(TEXT("ground bake"), EnsureGroundMaterial());
+		// -bf6matcheckforce adds RecompileMaterial on top of the wait.
+		//
+		// MEASURED TO CRASH: with this switch the run dies inside
+		// UnrealEditor-MaterialEditor on the water material, immediately after
+		// the two ground ones pass. So it is off by default and is not the way
+		// to verify a graph. The WAIT in Report does that instead, and it is
+		// unconditional. This stays only because a headless crash is free and
+		// pinning which material kills it is occasionally worth knowing.
+		const bool bForce = FParse::Param(FCommandLine::Get(), TEXT("bf6matcheckforce"));
+		Report(TEXT("water"), EnsureWaterMaterial(), bForce);
+		Report(TEXT("sky"), EnsureSkyMaterial(), bForce);
+		for (int32 k = 0; k < (int32)EKind::Count; k++)
+		{
+			const EKind Kind = (EKind)k;
+			const TCHAR* KindName =
+				Kind == EKind::Masked ? TEXT("masked")
+				: Kind == EKind::MaskedVeg ? TEXT("masked vegetation")
+				: Kind == EKind::Translucent ? TEXT("translucent")
+				: Kind == EKind::Road ? TEXT("road")
+				: Kind == EKind::Vista ? TEXT("vista") : TEXT("opaque");
+			Report(KindName, EnsureParentMaterial(Kind), bForce);
+		}
+	}
+}
+
+static FAutoConsoleCommand GCheckMaterialsCmd(
+	TEXT("BF6.HighPoly.CheckMaterials"),
+	TEXT("Build the High Poly ground materials and log whether they compiled."),
+	FConsoleCommandDelegate::CreateStatic(&BF6_CheckMaterials));
+
+// Reset when the EDITOR opens a map, not when we next happen to build.
+//
+// ReadLevel already drops stale caches when it notices the level changed, but
+// that only fires if the user builds again. Everything between opening the map
+// and that build ran on the previous map's state.
+FDelegateHandle GMapOpenedHandle;
+
 void FBF6HighPolyModule::StartupModule()
 {
+	GMapOpenedHandle = FEditorDelegates::OnMapOpened.AddLambda(
+		[](const FString& /*Filename*/, bool /*bAsTemplate*/)
+		{
+			UE_LOG(LogBF6HighPoly, Log, TEXT("map opened, resetting High Poly state"));
+			ResetPerMapState();
+		});
+
+	// -bf6matcheck: build the ground materials, log the verdict, exit.
+	//
+	// The console command above is the interactive way in. This is the
+	// headless one, and it exists because -ExecCmds DOES NOT FIRE in an editor
+	// launched with no map: the process boots, finishes its asset registry
+	// scan, and then sits in the tick loop forever having run nothing. Two
+	// attempts were lost to that before it was diagnosed from the log going
+	// quiet at the asset registry with only EOS heartbeats after it.
+	//
+	// Module startup always runs. The check itself waits for engine init,
+	// because building a material needs the shader compiler up.
+	if (FParse::Param(FCommandLine::Get(), TEXT("bf6matcheck")))
+	{
+		FCoreDelegates::OnFEngineLoopInitComplete.AddLambda([]()
+		{
+			UE_LOG(LogBF6HighPoly, Display, TEXT("CHECK starting"));
+			BF6_CheckMaterials();
+			UE_LOG(LogBF6HighPoly, Display, TEXT("CHECK done"));
+			// Only a headless run wants the process to end. Launched against a
+			// real editor the switch is a self-check the user watches, and
+			// exiting out from under them would be the wrong answer.
+			if (FParse::Param(FCommandLine::Get(), TEXT("bf6matcheckexit")))
+			{
+				FPlatformMisc::RequestExit(false);
+			}
+		});
+	}
+
 	BF6Ext::FPieEntry Entry;
 	Entry.Id    = FName("HighPoly.Root");
 	Entry.Label = TEXT("HIGH POLY");
@@ -3173,6 +6658,12 @@ void FBF6HighPolyModule::StartupModule()
 
 void FBF6HighPolyModule::ShutdownModule()
 {
+	if (GMapOpenedHandle.IsValid())
+	{
+		FEditorDelegates::OnMapOpened.Remove(GMapOpenedHandle);
+		GMapOpenedHandle.Reset();
+	}
+
 	BF6Ext::UnregisterPieEntry(FName("HighPoly.Root"));
 	// Anything we spawned goes with us: the tool never owned it.
 	if (GIsRunning) BF6Ext::ClearAddonActors(kAddonName);
