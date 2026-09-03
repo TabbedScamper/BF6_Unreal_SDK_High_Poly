@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: A problem with the base tool
+    url: https://github.com/TabbedScamper/BF6_Unreal_SDK/issues
+    about: Placement, export, the map selector, saves and blocks all live in BF6 Unreal SDK. Report those there.
+  - name: A Frostbite format question
+    url: https://github.com/TabbedScamper/BF6_Frostbite_Research
+    about: What the add-on knows about the game's data is written down in the research repo.

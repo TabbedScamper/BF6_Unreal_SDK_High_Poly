@@ -1,0 +1,66 @@
+name: Bug report
+description: Something broke, crashed, or drew wrong
+labels: [bug]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: Add-on version
+      description: From BF6HighPoly.uplugin, or the commit you built (for example 0.1.0, or a short hash).
+      placeholder: "0.1.0"
+    validations:
+      required: true
+  - type: input
+    id: tool-version
+    attributes:
+      label: BF6 Unreal SDK version
+      description: Shown on the map selector, bottom corner.
+      placeholder: "0.9.0"
+  - type: input
+    id: map
+    attributes:
+      label: Map
+      description: Which map were you on?
+      placeholder: "MP_Isolated"
+    validations:
+      required: true
+  - type: dropdown
+    id: layer
+    attributes:
+      label: Which layer is wrong?
+      options:
+        - Objects
+        - Terrain
+        - Roads
+        - Water
+        - Lighting
+        - The build itself never finished
+        - Something else
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What did you do, and what went wrong? Steps to reproduce are the fastest path to a fix.
+      placeholder: |
+        1. Opened MP_Isolated
+        2. HIGH POLY, layers Terrain and Water only, BUILD
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What it looks like in game
+      description: For anything visual, a screenshot of the add-on next to one of the same spot in game is worth more than any description.
+  - type: textarea
+    id: logs
+    attributes:
+      label: Log
+      description: Attach `Saved/Logs/BF6_Unreal_SDK.log` from your project folder, or paste the last 100 lines. The add-on logs every read and build step, including why a layer came back empty. If the editor crashed, also zip and attach the newest folder under `Saved/Crashes`.
+      render: text
+  - type: input
+    id: gpu
+    attributes:
+      label: GPU
+      description: Nanite and the water shading are the two places hardware matters.
+      placeholder: "RTX 4070"

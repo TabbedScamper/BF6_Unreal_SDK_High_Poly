@@ -1,0 +1,24 @@
+name: Feature request
+description: An idea, or something the game does that the add-on should draw
+labels: [enhancement]
+body:
+  - type: textarea
+    id: idea
+    attributes:
+      label: The idea
+      description: What should the add-on do?
+    validations:
+      required: true
+  - type: textarea
+    id: why
+    attributes:
+      label: Why it helps
+      description: What were you trying to build or judge when you wanted this?
+  - type: dropdown
+    id: parity
+    attributes:
+      label: Does the Godot high-poly plugin already do this?
+      options:
+        - "Yes, this is a parity gap"
+        - "No, this would be new"
+        - "Not sure"
