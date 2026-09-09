@@ -2,6 +2,79 @@
 
 ## 0.8.0 (2026-09-09)
 
+The first High Poly release numbered alongside the base SDK brings the installed game's scenery and configurable previews into the same map-building workflow. It requires BF6 Unreal SDK 0.8.0.
+
+**Explore the real map while you build**
+
+- Read the current level's geometry, materials and textures from your own Battlefield 6 installation, surrounding your editable SDK objects with the game's scenery.
+- Choose Low Poly for the SDK view, Clay for shapes and sightlines, or Textured for the detailed preview.
+- Switch Terrain, Roads, Objects, Water and Lighting independently to concentrate on the layers you need.
+- Preview geometry stays local. Portal exports retain SDK identities and transforms rather than including extracted high-detail meshes.
+- Switching maps clears the previous scenery. Results from an old map's background build are discarded rather than appearing in the next map.
+
+**One High Poly panel**
+
+- HIGH POLY opens an organized panel with the current map and installation status at the top.
+- Controls are grouped into look, layers, game mode, build, placed objects and previews, water, and setup.
+- Live rows show progress, preview counts and failures without making you reopen the panel.
+- Water Lab is accessible from the panel. The alternate ring remains available through BF6.HighPoly.Ring.
+
+**Soldiers and customizable loot**
+
+- Select a supported soldier or loot spawner and press Space, or open the Loadout pill.
+- Soldier spawners display a posed character holding a weapon. Choose supported characters, outfits, factions and poses.
+- Loot spawners default to an M4A1 positioned against the SDK marker. Choose a weapon, gadget or throwable and configure supported weapon attachments.
+- Selections are saved as local preview metadata. Preview components belong to the editable spawner so selection can reach the underlying object.
+- Generate a weapon card from the same loadout and edit it in the SDK's UI builder. Updating the weapon configuration preserves an existing card layout.
+- Send the configuration to Blocks as a base-loot recipe, or to Script as a configured pickup helper. Use those building pieces in your own proximity prompts, buy stations and weapon progression.
+- Gameplay attachments require mode logic: the helper replaces a confirmed pickup in its weapon slot with the configured attachment package. Preview choices alone do not change Portal gameplay.
+
+**Vehicles and placed objects**
+
+- Vehicle previews assemble supported third-person wheels, tracks, cockpit and mounted-weapon parts, including repeated instances.
+- Supported mounts use the vehicle or attachment skeleton rather than placing every member at the root.
+- Placed-object resolution follows asset metadata and the current level's material scopes, improving replacements for renamed and imported SDK objects.
+- Nearby placed objects can use the real model while distant objects use the SDK representation. Camera-driven swapping works in the editor viewport, with hysteresis to reduce boundary flicker.
+- Object-library and quick-selection previews use the same High Poly picture provider.
+
+**Terrain, roads, water and lighting**
+
+- Terrain reads the game's heightfield and ground layers; road markings and wear contribute to the map preview.
+- Nanite is available for built static geometry, with build-time and rendering tradeoffs.
+- Water uses Unreal's water shading with values derived from the level, including color, wave direction, speed and wavelength. Water Lab exposes inspection and tuning controls.
+- Water simulation pauses when the water layer is hidden, the scene is cleared or Low Poly mode is active.
+- Lighting uses supported authored sun, sky, fog and placed-light data. Vegetation has a wind preview.
+- Supported game-mode layouts can be inspected on the same map. Inactive mode variants are excluded from spatial export so their objective IDs do not collide.
+
+**Materials that were missing or wrong**
+
+- Glass transmits the background instead of rendering opaque black.
+- Police-sedan liveries composite over the paint using their authored UV layout and transparency.
+- Billboard advertisement textures and additional mesh-owned placed-object material bindings are recognized.
+- Exact-metadata vegetation, including the reported umbrella and manzanita cases, can use its authored transform when the SDK canopy is too different for a reliable bounds fit.
+- Soldier eyes use separate iris and sclera texture bindings.
+- Smoke backdrop cards use authored textures and alpha instead of appearing as untextured white rectangles from outside. The known packed rising-smoke sheet has viewport animation.
+- Versioned caches invalidate older incomplete material and placed-object records.
+
+**Installation, progress and stability**
+
+- Install from the SDK's map selector. The regular update button checks the matching pair, and New Features displays both sets of notes.
+- EA App and Steam installations are supported. Choose the game folder yourself when automatic detection cannot find it.
+- The add-on uses the SDK's packaged native reader. No extracted game assets are included in the download.
+- Progress includes placed-object replacement, loadout previews and final asset/shader compilation before reporting completion.
+- Cancellation reports an incomplete build. Map switches and shutdown wait for or discard work according to the map it belongs to.
+- Native-reader access is serialized between geometry and sound decoding; sound workers finish before their context is released.
+
+**Current limits**
+
+- Cold builds can exceed ten seconds. Performance depends on map size, enabled layers and hardware; universal 60 FPS is not established.
+- Unsupported vehicle mounts are omitted and reported as incomplete, including a known Abrams driver-camera mount.
+- Smoke cards can still show sharp intersections when flown through. Preview animation does not reconstruct the full particle system or exact authored timing.
+- Terrain, water and specialized materials retain approximations; coverage varies across maps and assets.
+- Configured pickup logic requires mode integration and Portal playtesting. It does not preserve ammunition; the optional conservative watcher requires two distinct known weapons already equipped.
+
+**Detailed fixes and release history**
+
 **Spawner loadouts**
 
 - Select a loot or soldier spawner and press Space, or use the LOADOUT pill, to edit its preview. Loot defaults to an M4A1 aligned to the SDK marker. Soldier spawners show a posed character holding a weapon, with character, outfit, faction and pose choices.
