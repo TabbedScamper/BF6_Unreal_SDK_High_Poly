@@ -27,11 +27,30 @@ public class BF6HighPoly : ModuleRules
 			"Slate",
 			"SlateCore",
 			"InputCore",
+			// theme.json: the season palette is data, read at runtime and shared
+			// with the Godot plugin. The single-file compile does not link, so a
+			// missing module here shows up only in a real build.
+			"Json",
 			// GMaxRHIShaderPlatform, for the material self-check. The
 			// single-file compile does not link, so a missing module here
 			// shows up only in a real build.
-			"RHI"
+			"RHI",
+			"RenderCore",
+			// The ocean compute kernels. They live in their own module because
+			// shader types must register at PostConfigInit, before the global
+			// shader map is built; declaring one from this module fails DLL
+			// static init outright.
+			"BF6HighPolyShaders"
 		});
+
+		if (Target.Platform == UnrealTargetPlatform.Win64)
+		{
+			// The water path feeds BF6's installed DXIL containers directly to
+			// Unreal's public D3D12 interop surface. No exported shader files and
+			// no CPU shader translation are involved.
+			PrivateDependencyModuleNames.Add("D3D12RHI");
+			PublicSystemLibraries.Add("d3d12.lib");
+		}
 
 		if (Target.bBuildEditor)
 		{

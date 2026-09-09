@@ -6,12 +6,14 @@ This is a community-made project. It is not affiliated with EA or DICE.
 
 BF6 Unreal SDK builds Portal maps out of the official SDK's low-poly proxy assets. This add-on reads your own Battlefield 6 install and draws the real thing around them: the actual meshes, the actual materials and textures, the map's terrain, its water and its lighting, as a preview you build inside.
 
-It is a drop-in folder. Copy it into `Plugins/Add-Ons/`, and the tool grows a **HIGH POLY** page on its build radial. Delete the folder and the tool is exactly what it was.
+Install it from the SDK's map selector, or copy the release folder into `Plugins/Add-Ons/`. The tool adds a **HIGH POLY** panel and a **LOADOUT** pill for spawner previews. Both components use the existing update button and NEW FEATURES view.
 
 ## What it does
 
 - **The real level, around your map.** Every prop, building and fixture the game places, at its real transform, decoded out of your installed game files rather than any redistributed asset pack.
-- **Preview only, by construction.** Nothing the add-on builds is part of your map. Its actors carry none of the tool's own tags, so the exporter, the budget bar, the scene tree, the placement rays and the save file cannot see them. There is no setting to get this wrong.
+- **Preview geometry stays local.** The map exports SDK object identities and transforms. Preview loadout choices are stored locally; use the generated script helpers to make weapon attachments affect gameplay.
+- **Editable spawner previews.** Select a soldier or loot spawner and press **Space**. Choose characters, outfits, faction, poses, weapons and available attachments. Generate a weapon card or TypeScript helper from the same configuration. Vehicle previews include supported wheels, tracks, cockpit and mounted-weapon parts.
+- **Backdrop smoke.** Textured, transparent smoke cards replace untextured white planes. The known packed rising-smoke sheet animates in the viewport.
 - **Three modes.** **LOW-POLY** hides everything the add-on built, leaving just your map the way it exports. **CLAY** is the real level in study grey, for shapes and sightlines without the noise of textures. **TEXTURED** is the full thing.
 - **Five layers you can switch off.** Terrain, Roads, Objects, Water and Lighting, each with its own cost, so you can build against the ground alone on a big map and turn the rest on when you want to look.
 - **Water with the game's own numbers.** Unreal's Single Layer Water shading, fed the level's authored water colour as a per-metre transmission, so absorption and scattering are derived rather than dialled in. Waves come from the map's own ocean simulation entity (direction, speed, chop, wavelength), foam from the wave fold, and the shore fade is read off the terrain heightfield.
@@ -24,7 +26,7 @@ It is a drop-in folder. Copy it into `Plugins/Add-Ons/`, and the tool grows a **
 
 ## Requirements
 
-- [BF6 Unreal SDK](https://github.com/TabbedScamper/BF6_Unreal_SDK), with the add-on extension API (v2 or newer)
+- [BF6 Unreal SDK 0.8.0](https://github.com/TabbedScamper/BF6_Unreal_SDK/releases/tag/v0.8.0), matching this add-on's release
 - Unreal Engine 5.8, Windows
 - **A legitimate installed copy of Battlefield 6.** The add-on reads assets out of your own install and ships none of its own. On first use it asks where the game is; the folder must contain `bf6.exe`, because the executable carries the type schema that makes the level data readable.
 
@@ -32,7 +34,11 @@ No game assets are redistributed here, and none ever will be. This repository is
 
 ## Install
 
-There are no releases yet. Build it from source:
+Recommended: update the SDK to **0.8.0**, then choose **Install High Poly** on its map selector. The tool downloads the matching add-on and prepares the restart needed to install it. Steam and EA App installs can be detected; use the game-folder selector if your install is elsewhere.
+
+Manual install: close Unreal, download **BF6HighPoly_Plugin_v0.8.0.zip** from [Releases](../../releases/latest), and extract its `BF6HighPoly` folder into your project's `Plugins/Add-Ons/`. Reopen the project, open a map, choose HIGH POLY and build. Game assets are read locally and are not included in the download.
+
+To build from source:
 
 1. Clone [BF6 Unreal SDK](https://github.com/TabbedScamper/BF6_Unreal_SDK) and get it opening normally first.
 2. Clone this repository into `Plugins/Add-Ons/BF6HighPoly` inside that project.
@@ -49,7 +55,7 @@ The add-on ships no `.uasset` content on purpose. Its materials are built as gra
 
 ## Status
 
-Early, and honest about it. Geometry, materials, terrain, roads, water, lighting, Nanite, wind and the mode and layer switches all work on real maps. Known rough edges: terrain material composition is still being finished against the recovered layer model, some vegetation and glass materials are approximations rather than the recovered shader, and the ocean's frame-exact displacement waits on the game's own FFT compute kernels (the current waves are a Gerstner approximation derived from the authored simulation inputs).
+This release includes geometry, materials, terrain, roads, water, lighting and editable loadout previews. Cold builds can exceed ten seconds; frame rate depends on the map and hardware. Some specialized materials and water remain approximations. Vehicle coverage varies: unsupported mounts are omitted and reported as an incomplete preview, including the Abrams driver-camera mount. See [the release notes](Resources/CHANGELOG.md) for details.
 
 ## Credits
 

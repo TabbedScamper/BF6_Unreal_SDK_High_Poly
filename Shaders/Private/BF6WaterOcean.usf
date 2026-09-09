@@ -1,0 +1,273 @@
+// BF6 ocean simulation kernels, as Unreal compute shaders.
+//
+// WHY REWRITTEN RATHER THAN DISPATCHED. The shipped DXIL was previously
+// dispatched through a native D3D12 escape hatch that created its own
+// resources, descriptor heaps and pipeline states. It failed its own numerical
+// replay (rel-L2 1.215) and then produced a DMA page fault and a hung device,
+// because resources outside Unreal's residency and state tracking get evicted
+// or transitioned underneath an in-flight dispatch. The algorithm is fully
+// decoded (finding ocean-fft-kernels-decoded), so nothing is lost by expressing
+// it as ordinary Unreal shaders that RDG can own, barrier and validate.
+//
+// THIS KERNEL DELIBERATELY MIRRORS THE CPU REPLAY, constant for constant,
+// including two places where the replay and the decoded spec disagree:
+//
+//   * g. The replay uses 9.8; the decoded dispersion kernel uses 9.81. The
+//     game's H0 builder does use 9.8 (its 1/9.8 terms are read straight from
+//     the image), so the two constants may both be real and belong to different
+//     stages. Matching the replay here keeps this comparison a test of the GPU
+//     PLUMBING; changing g is a separate decision with its own evidence.
+//   * The zero-K bin. The replay divides by (K + 1e-5) with no guard, so the
+//     bin at (N/2, N/2) keeps a height rather than being zeroed. Guarding it
+//     would produce a one-texel disagreement that looks like a bug.
+//
+// Mirroring on purpose is the point: any disagreement this reports is a
+// dispatch, indexing or readback fault, not arithmetic.
+
+#include "/Engine/Public/Platform.ush"
+
+Buffer<float2> H0;                  // [y*N + x], (real, imag)
+RWTexture2D<float2> OutHeight;
+RWTexture2D<float2> OutDispX;
+RWTexture2D<float2> OutDispY;
+
+uint  N;
+float TileM;
+float Time;
+float Pad0;
+
+// PI is declared in Common.ush, not Platform.ush. Rather than pull Common.ush
+// into a standalone compute kernel, spell the constant out - and spell it out
+// as the exact float32 the CPU replay uses, so the two sides agree to the bit
+// rather than to whatever precision an engine header happens to carry.
+static const float BF6_PI = 3.1415927410125732421875f;
+
+[numthreads(8, 8, 1)]
+void MainDispersionCS(uint3 Tid : SV_DispatchThreadID)
+{
+	const uint x = Tid.x, y = Tid.y;
+	if (x >= N || y >= N) return;
+
+	const uint Mirror = ((N - y) & (N - 1)) * N + ((N - x) & (N - 1));
+
+	// Sign convention is the replay's: -PI on x, +PI on y.
+	const float Kx = ((float)(x + x) - (float)N) * (-BF6_PI) / TileM;
+	const float Ky = ((float)(y + y) - (float)N) * ( BF6_PI) / TileM;
+	const float K  = sqrt(Kx * Kx + Ky * Ky);
+
+	const float Phase = sqrt(9.8 * K) * Time;
+	const float Co = cos(Phase), Si = sin(Phase);
+
+	const float2 h0  = H0[y * N + x];
+	const float2 h0m = H0[Mirror];
+
+	// A = h0 * (Co + i Si)
+	const float2 A = float2(h0.x * Co - h0.y * Si, h0.x * Si + h0.y * Co);
+	// B = conj(h0m) * (Co - i Si)
+	const float2 HM = float2(h0m.x, -h0m.y);
+	const float2 B = float2(HM.x * Co + HM.y * Si, -HM.x * Si + HM.y * Co);
+
+	const float2 H = A + B;
+
+	const float InvK = 1.0 / (K + 1.0e-5);
+	const float FX = Kx * InvK;
+	const float FY = Ky * InvK;
+
+	OutHeight[uint2(x, y)] = H;
+	OutDispX[uint2(x, y)]  = float2(H.y * FX, -H.x * FX);   // -i * (kx/k) * h
+	OutDispY[uint2(x, y)]  = float2(H.y * FY, -H.x * FY);
+}
+
+// ---------------------------------------------------------------------------
+// FFT
+//
+// Matches the CPU replay's transform exactly in FORM: iterative Cooley-Tukey,
+// decimation in time, with a POSITIVE exponent (twiddle exp(+i*2*pi*j/Len)),
+// which is the unnormalised inverse transform. Getting that sign wrong mirrors
+// the ocean and still looks plausible, so it is stated rather than assumed.
+//
+// One thread group per line, the whole line held in groupshared memory. That is
+// the same shape as the game's csWaterOceanFftSinglePass rather than a
+// ping-pong across dispatches.
+//
+// The twiddles here are computed directly from the angle instead of by the
+// replay's incremental rotation. The recurrence is sequential by nature and
+// accumulates its own drift; computing each angle is both parallelisable and
+// slightly more accurate, so small disagreement with the CPU at the last bits
+// is expected and is not a porting error.
+
+Texture2D<float2>   FftIn;
+RWTexture2D<float2> FftOut;
+uint FftN;
+uint FftAxis;        // 0 = along x (rows), 1 = along y (columns)
+uint FftLogN;
+uint FftPad;
+
+#define BF6_FFT_THREADS 128
+#define BF6_FFT_MAXLINE 512
+
+groupshared float2 BF6FftLine[BF6_FFT_MAXLINE];
+
+uint BF6BitReverse(uint Value, uint Bits)
+{
+	uint R = 0;
+	for (uint b = 0; b < Bits; ++b)
+	{
+		R = (R << 1) | (Value & 1u);
+		Value >>= 1;
+	}
+	return R;
+}
+
+[numthreads(BF6_FFT_THREADS, 1, 1)]
+void MainFftCS(uint3 Gid : SV_GroupID, uint3 Tid : SV_GroupThreadID)
+{
+	const uint Line = Gid.x;              // which row or column
+	const uint N = FftN;
+	if (Line >= N || N > BF6_FFT_MAXLINE) return;
+
+	// Load the line, already bit-reversed. Gathering from the reversed index is
+	// equivalent to the replay's in-place swap pass and needs no barrier.
+	for (uint i = Tid.x; i < N; i += BF6_FFT_THREADS)
+	{
+		const uint Src = BF6BitReverse(i, FftLogN);
+		const uint2 Coord = (FftAxis == 0) ? uint2(Src, Line) : uint2(Line, Src);
+		BF6FftLine[i] = FftIn[Coord];
+	}
+	GroupMemoryBarrierWithGroupSync();
+
+	const uint Half = N >> 1;
+	for (uint Len = 2; Len <= N; Len <<= 1)
+	{
+		const uint H = Len >> 1;
+		for (uint b = Tid.x; b < Half; b += BF6_FFT_THREADS)
+		{
+			const uint Block = b / H;
+			const uint j = b - Block * H;
+			const uint i0 = Block * Len + j;
+			const uint i1 = i0 + H;
+
+			// exp(+i * 2*pi*j/Len), the replay's sign.
+			const float Angle = 2.0 * BF6_PI * (float)j / (float)Len;
+			float S, C;
+			sincos(Angle, S, C);
+
+			const float2 A = BF6FftLine[i0];
+			const float2 Bv = BF6FftLine[i1];
+			const float2 B = float2(Bv.x * C - Bv.y * S, Bv.x * S + Bv.y * C);
+
+			BF6FftLine[i0] = A + B;
+			BF6FftLine[i1] = A - B;
+		}
+		GroupMemoryBarrierWithGroupSync();
+	}
+
+	for (uint o = Tid.x; o < N; o += BF6_FFT_THREADS)
+	{
+		const uint2 Coord = (FftAxis == 0) ? uint2(o, Line) : uint2(Line, o);
+		FftOut[Coord] = BF6FftLine[o];
+	}
+}
+
+// ---------------------------------------------------------------------------
+// ASSEMBLE, FOAM and DIFF: everything the replay does after the transform.
+//
+// Three dispatches rather than one, because each needs the previous one to be
+// COMPLETE across the whole texture: foam reads the displacement's neighbours,
+// and the blur reads foam's. Folding them together would read half-written
+// data at group boundaries and produce a seam that only shows up at certain
+// resolutions.
+
+// Fed as buffers, not textures: RDG has a first-class upload path for buffers
+// and none for textures, and this stage's inputs come from the CPU only in the
+// proof harness anyway.
+Buffer<float2>      AsmHeight;
+Buffer<float2>      AsmDispX;
+Buffer<float2>      AsmDispY;
+RWTexture2D<float4> AsmOut;
+
+Texture2D<float4>   FoamDisp;
+Buffer<float>       FoamPrev;
+RWTexture2D<float>  FoamOut;
+
+Texture2D<float4>   DiffDisp;
+Texture2D<float>    DiffFoam;
+RWTexture2D<float4> DiffOut;
+
+uint  SurfN;
+float SurfDerivScale;     // N / (2 * tile)
+float SurfFoamThreshold;
+float SurfFoamMax;
+float SurfLag;            // pow(0.5, dt / halfLife), or 0 when foam is off
+float SurfFoamEnabled;
+float SurfPad0;
+float SurfPad1;
+
+uint2 BF6Wrap(int2 P, uint N)
+{
+	return uint2((uint)(P.x) & (N - 1), (uint)(P.y) & (N - 1));
+}
+
+// The (x+y) sign flip is the FFT shift: it recentres the transform output so
+// the tile is continuous across its own wrap. Dropping it produces a surface
+// that tiles with a hard checker seam.
+[numthreads(8, 8, 1)]
+void MainAssembleCS(uint3 Tid : SV_DispatchThreadID)
+{
+	const uint x = Tid.x, y = Tid.y;
+	if (x >= SurfN || y >= SurfN) return;
+	const uint I = y * SurfN + x;
+	const float Sign = ((x + y) & 1u) ? -1.0 : 1.0;
+	AsmOut[uint2(x, y)] = float4(Sign * AsmDispX[I].x,
+	                             Sign * AsmHeight[I].x,
+	                             Sign * AsmDispY[I].x, 0.0);
+}
+
+[numthreads(8, 8, 1)]
+void MainFoamCS(uint3 Tid : SV_DispatchThreadID)
+{
+	const uint x = Tid.x, y = Tid.y;
+	if (x >= SurfN || y >= SurfN) return;
+	const uint N = SurfN;
+	const float3 L = FoamDisp[BF6Wrap(int2(x - 1, y), N)].xyz;
+	const float3 R = FoamDisp[BF6Wrap(int2(x + 1, y), N)].xyz;
+	const float3 B = FoamDisp[BF6Wrap(int2(x, y - 1), N)].xyz;
+	const float3 T = FoamDisp[BF6Wrap(int2(x, y + 1), N)].xyz;
+
+	// Jacobian fold: how much the horizontal displacement is compressing.
+	const float Fold = SurfDerivScale * ((R.x - L.x) + (T.z - B.z));
+	const float Instant = (SurfFoamEnabled > 0.5 && SurfFoamMax > 0.0)
+		? max(0.0, Fold - SurfFoamThreshold) * SurfFoamMax : 0.0;
+
+	// lerp(Instant, Previous, Lag): the replay's argument order, where Lag is
+	// how much of the PREVIOUS frame survives.
+	FoamOut[uint2(x, y)] = lerp(Instant, FoamPrev[y * SurfN + x], SurfLag);
+}
+
+[numthreads(8, 8, 1)]
+void MainDiffCS(uint3 Tid : SV_DispatchThreadID)
+{
+	const uint x = Tid.x, y = Tid.y;
+	if (x >= SurfN || y >= SurfN) return;
+	const uint N = SurfN;
+	const float3 L = DiffDisp[BF6Wrap(int2(x - 1, y), N)].xyz;
+	const float3 R = DiffDisp[BF6Wrap(int2(x + 1, y), N)].xyz;
+	const float3 B = DiffDisp[BF6Wrap(int2(x, y - 1), N)].xyz;
+	const float3 T = DiffDisp[BF6Wrap(int2(x, y + 1), N)].xyz;
+
+	// Height is .y, so the slope comes from the y components.
+	float3 Nrm = normalize(float3(-SurfDerivScale * (R.y - L.y),
+	                              -SurfDerivScale * (T.y - B.y), 1.0));
+
+	// 3x3 tent, weights 2 on the centre row and column, normalised by 16.
+	float Foam = 0.0;
+	[unroll] for (int oy = -1; oy <= 1; ++oy)
+	[unroll] for (int ox = -1; ox <= 1; ++ox)
+	{
+		const float W = (ox == 0 ? 2.0 : 1.0) * (oy == 0 ? 2.0 : 1.0);
+		Foam += W * DiffFoam[BF6Wrap(int2(x + ox, y + oy), N)];
+	}
+	Foam *= 1.0 / 16.0;
+
+	DiffOut[uint2(x, y)] = float4(Foam, Nrm.x * 0.5 + 0.5, Nrm.y * 0.5 + 0.5, 1.0);
+}

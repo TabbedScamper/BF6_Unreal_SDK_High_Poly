@@ -1,0 +1,10 @@
+{
+  "cell_h": 267,
+  "cell_w": 160,
+  "cells": 96,
+  "cols": 12,
+  "fps": 12,
+  "note": "Frames of the Godot plugin's waves backdrop, every second frame at 12 fps. Rebuild with the extractor in the session scratchpad if the video changes.",
+  "rows": 8,
+  "source": "waves.ogv"
+}

@@ -1,9 +1,9 @@
 {
 	"FileVersion": 3,
-	"Version": 1,
-	"VersionName": "0.1.0",
+	"Version": 2,
+	"VersionName": "0.8.0",
 	"FriendlyName": "BF6 High Poly",
-	"Description": "Full-detail Battlefield 6 geometry, materials and terrain for the BF6 Unreal SDK. Adds a HIGH POLY pill to the build radial and changes nothing else in the tool.",
+	"Description": "Detailed Battlefield 6 maps, materials, terrain and configurable soldier, weapon and vehicle previews for the BF6 Unreal SDK.",
 	"Category": "Editing",
 	"CreatedBy": "TabbedScamper",
 	"EnabledByDefault": true,
@@ -11,6 +11,11 @@
 	"IsBetaVersion": true,
 	"Installed": false,
 	"Modules": [
+		{
+			"Name": "BF6HighPolyShaders",
+			"Type": "Editor",
+			"LoadingPhase": "PostConfigInit"
+		},
 		{
 			"Name": "BF6HighPoly",
 			"Type": "Editor",

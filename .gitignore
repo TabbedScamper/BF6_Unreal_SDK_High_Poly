@@ -1,2 +1,5 @@
 Binaries/
 Intermediate/
+
+# The SDK owns the shared native reader.
+/Source/ThirdParty/libbf6/bin/
