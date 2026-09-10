@@ -25,6 +25,7 @@ namespace
 	typedef bf6_mesh* (*FnReadMeshScoped)(bf6_ctx*, const char*, int, const char*, const char*);
 	typedef const bf6_texture* (*FnTextureAt)(bf6_ctx*, int);
 	typedef const bf6_texture* (*FnTextureAtMaxDim)(bf6_ctx*, int, int);
+	typedef void (*FnReleaseTexturePayload)(bf6_ctx*, int, int);
 	typedef const char* (*FnTextureNameAt)(bf6_ctx*, int);
 	typedef int (*FnTextureIdByName)(bf6_ctx*, const char*);
 	typedef int (*FnWater)(bf6_ctx*, const char*, bf6_water*, int);
@@ -70,6 +71,7 @@ namespace
 	FnReadMeshScoped GReadArmoryScoped = nullptr;
 	FnTextureAt GTextureAt = nullptr;
 	FnTextureAtMaxDim GTextureAtMaxDim = nullptr;
+	FnReleaseTexturePayload GReleaseTexturePayload = nullptr;
 	FnTextureNameAt GTextureNameAt = nullptr;
 	FnTextureIdByName GTextureIdByName = nullptr;
 	FnWater     GWater     = nullptr;
@@ -199,6 +201,7 @@ bool FCore::Open(const FString& GameDir, const FString& DllPath)
 	GReadScoped  = (FnReadMeshScoped) FPlatformProcess::GetDllExport(Dll, TEXT("bf6_read_mesh_scoped"));
 	GReadArmoryScoped = (FnReadMeshScoped) FPlatformProcess::GetDllExport(Dll, TEXT("bf6_read_armory_mesh_scoped"));
 	GTextureAt   = (FnTextureAt) FPlatformProcess::GetDllExport(Dll, TEXT("bf6_texture_at"));
+	GReleaseTexturePayload = (FnReleaseTexturePayload)FPlatformProcess::GetDllExport(Dll, TEXT("bf6_release_texture_payload"));
 	GTextureAtMaxDim = (FnTextureAtMaxDim)FPlatformProcess::GetDllExport(
 		Dll, TEXT("bf6_texture_at_max_dim"));
 	GTextureNameAt = (FnTextureNameAt)FPlatformProcess::GetDllExport(
@@ -239,6 +242,7 @@ bool FCore::Open(const FString& GameDir, const FString& DllPath)
 	char err[512] = {0};
 	Ctx = GOpen(TCHAR_TO_UTF8(*GameDir), err, sizeof(err));
 	if (!Ctx) { Error = UTF8_TO_TCHAR(err); return false; }
+	TextureSession = FGuid::NewGuid();
 	OpenedFor = GameDir;   // so a later Open for a different install is caught
 	if (GSetProgress) GSetProgress(Ctx, &ProgressThunk, &Progress);
 	return true;
@@ -383,7 +387,7 @@ FString FCore::MeshResourceFor(const FString& PlacementPath)
 
 bool FCore::ReadMesh(const FString& ResName, TArray<FSection>& Out,
                      const FString& PlacingBundle, const FString& Variation,
-                     const TArray<FMatrix44f>* Skin, int32 RigBoneCount)
+                     const TArray<FMatrix44f>* Skin, int32 RigBoneCount, int32 Lod)
 {
 	Out.Reset();
 	if (!Ctx || !GReadMesh) { Error = TEXT("no install open"); return false; }
@@ -395,11 +399,12 @@ bool FCore::ReadMesh(const FString& ResName, TArray<FSection>& Out,
 			|| ResName.StartsWith(TEXT("common/characters/"), ESearchCase::IgnoreCase))
 		? GReadArmoryScoped : GReadScoped;
 	bf6_mesh* m = ReadScoped
-		? ReadScoped(Ctx, TCHAR_TO_UTF8(*ResName), 0,
+		? ReadScoped(Ctx, TCHAR_TO_UTF8(*ResName), Lod,
 			PlacingBundle.IsEmpty() ? nullptr : TCHAR_TO_UTF8(*PlacingBundle),
 			Variation.IsEmpty() ? nullptr : TCHAR_TO_UTF8(*Variation))
-		: GReadMesh(Ctx, TCHAR_TO_UTF8(*ResName), 0);
+		: GReadMesh(Ctx, TCHAR_TO_UTF8(*ResName), Lod);
 	if (!m) { Error = FString::Printf(TEXT("no mesh at %s"), *ResName); return false; }
+	if (Lod < 0 || Lod >= m->lod_count) { if (GFree) GFree(Ctx, m); Error = TEXT("authored LOD unavailable"); return false; }
 
 	// A SCOPED READ THAT BOUND NOTHING IS NOT AN ANSWER.
 	//
@@ -431,7 +436,10 @@ bool FCore::ReadMesh(const FString& ResName, TArray<FSection>& Out,
 				&& GMaterialScopeExists(Ctx, TCHAR_TO_UTF8(*PlacingBundle)) == 1;
 			if (!bScopeExists)
 			{
-				if (bf6_mesh* Plain = GReadMesh(Ctx, TCHAR_TO_UTF8(*ResName), 0))
+				// Retry in the mesh's own scope while retaining its authored
+				// variation and the hardware/character reader route.
+				if (bf6_mesh* Plain = ReadScoped(Ctx, TCHAR_TO_UTF8(*ResName), Lod, nullptr,
+					Variation.IsEmpty() ? nullptr : TCHAR_TO_UTF8(*Variation)))
 				{
 					bool bPlainBound = false;
 					for (int32 mi = 0; mi < Plain->material_count && !bPlainBound; mi++)
@@ -455,6 +463,16 @@ bool FCore::ReadMesh(const FString& ResName, TArray<FSection>& Out,
 
 		FSection out;
 		out.bDecal = s.is_decal != 0;
+		if (s.colors)
+		{
+			out.Colors.Reserve(s.vertex_count);
+			for (int32 v = 0; v < s.vertex_count; ++v)
+			{
+				const uint32 C = s.colors[v];
+				out.Colors.Add(FVector4f((C & 255) / 255.f, ((C >> 8) & 255) / 255.f,
+					((C >> 16) & 255) / 255.f, ((C >> 24) & 255) / 255.f));
+			}
+		}
 		out.Pos.Reserve(s.vertex_count);
 		for (int32 v = 0; v < s.vertex_count; v++)
 			out.Pos.Add(FVector3f(s.positions[v * 3], s.positions[v * 3 + 1], s.positions[v * 3 + 2]));
@@ -1408,7 +1426,14 @@ bool FCore::ReadWater(const FString& Level, TArray<FWater>& Out)
 				// A NEGATIVE SENTINEL MEANS ABSENT, not zero. Zero is a legal
 				// authored value for most of this, and two of the four ocean
 				// levels carry none of the named slots at all.
-				if (s.extinction[0] >= 0.f)
+				// Older readers left extinction zero-initialized when the graph
+				// supplied no absorption distance. Accept only a complete derived
+				// coefficient set; raw-colour bypasses need the renderer fallback.
+				if (s.absorption_distance_m > 0.01f &&
+					FMath::IsFinite(s.absorption_distance_m) &&
+					FMath::IsFinite(s.extinction[0]) && s.extinction[0] >= 0.f &&
+					FMath::IsFinite(s.extinction[1]) && s.extinction[1] >= 0.f &&
+					FMath::IsFinite(s.extinction[2]) && s.extinction[2] >= 0.f)
 					Out[i].Extinction = FLinearColor(
 						s.extinction[0], s.extinction[1], s.extinction[2]);
 				if (s.surface_colour[0] >= 0.f)
@@ -1703,6 +1728,12 @@ bool FCore::ReadScatter(const FString& Level, TArray<FScatter>& Out)
 		Out.Add(MoveTemp(S));
 	}
 	return true;
+}
+
+void FCore::ReleaseTexturePayload(int32 Id, int32 MaxDim)
+{
+	if (Ctx && GReleaseTexturePayload && GTextureAtMaxDim && MaxDim > 0)
+		GReleaseTexturePayload(Ctx, Id, MaxDim);
 }
 
 bool FCore::TextureAt(int32 Id, FTexture& Out, int32 MaxDim)

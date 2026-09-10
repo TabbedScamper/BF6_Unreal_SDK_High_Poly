@@ -63,6 +63,7 @@ namespace BF6HP::DiskCache
 	struct FStats
 	{
 		int32  Hits = 0, Misses = 0, Writes = 0;
+		int32  WritesSkipped = 0; // optional write queue exceeded its memory budget
 		int64  BytesRead = 0, BytesWritten = 0;
 		// Bytes before Pack, for the blobs that went through it: the ratio
 		// against BytesWritten is what the compression bought.

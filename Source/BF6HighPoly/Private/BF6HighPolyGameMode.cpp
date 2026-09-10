@@ -351,6 +351,10 @@ namespace
 	void FinishMine(TMap<FString, FMode>&& Modes, const FString& Summary, const FString& Error, const FString& Level)
 	{
 		GMining = false;
+		// The native worker can finish while OnEnginePreExit waits for it. Its
+		// already-queued game-thread completion must not publish UI state or
+		// apply a mode after shutdown has begun.
+		if (IsEngineExitRequested()) { GApplyAfterMine = false; return; }
 		if (Level != GLevel) return;   // the map changed under the worker
 		if (!Error.IsEmpty())
 		{
@@ -392,11 +396,12 @@ namespace
 	// bf6_core frames on the stack, as the editor exited. The miner is started
 	// and forgotten, so there is no future to wait on; this is the join.
 	std::atomic<int32> GMineWorkers{ 0 };
+	std::atomic<bool> GMineClosing{ false };
 
 	void MineOffThread(const FString& Level, const FString& Install, const FString& Dll)
 	{
-		GMineWorkers.fetch_add(1);
 		ON_SCOPE_EXIT{ GMineWorkers.fetch_sub(1); };
+		if (GMineClosing.load()) return;
 		TMap<FString, FMode> Modes;
 		FString Summary, Error;
 		const double T0 = FPlatformTime::Seconds();
@@ -2502,27 +2507,27 @@ namespace
 
 	void Shutdown()
 	{
+		GMineClosing.store(true);
 		BF6Ext::UnregisterPieEntry(FName("HighPoly.GameMode"));
 		if (GTicker.IsValid()) { FTSTicker::GetCoreTicker().RemoveTicker(GTicker); GTicker.Reset(); }
 
 		// NOBODY IS INSIDE THE READER WHEN IT CLOSES.
 		//
-		// The miner runs on a background thread and was started and forgotten,
-		// so this used to free the context under it. Ten seconds is far longer
-		// than a mine takes and still bounded, because a hang on exit is its own
-		// bug; if it ever expires the log says so rather than the editor dying
-		// quietly on the way out.
-		const double JoinBy = FPlatformTime::Seconds() + 10.0;
-		while (GMineWorkers.load() > 0 && FPlatformTime::Seconds() < JoinBy)
+		// Ten seconds is insufficient on restricted CPUs. Leaving the context
+		// allocated after a timeout did not keep its DLL loaded: a quick-exit
+		// dump caught a worker executing inside unloaded bf6_core.dll. Finish
+		// the reader before allowing module teardown, including queued workers.
+		const double JoinStarted = FPlatformTime::Seconds();
+		bool ReportedWait = false;
+		while (GMineWorkers.load() > 0)
 		{
+			if (!ReportedWait && FPlatformTime::Seconds() - JoinStarted > 10.0)
+			{
+				ReportedWait = true;
+				UE_LOG(LogBF6HighPolyGM, Warning,
+					TEXT("game modes: waiting for the active reader before unloading its DLL"));
+			}
 			FPlatformProcess::Sleep(0.01f);
-		}
-		if (GMineWorkers.load() > 0)
-		{
-			UE_LOG(LogBF6HighPolyGM, Warning,
-				TEXT("game modes: a reader worker did not finish in ten seconds; the context is being left open ")
-				TEXT("rather than freed under it."));
-			return;
 		}
 		// close while the dll is still loaded, never from a static destructor
 		GCore.Shutdown();
@@ -2637,11 +2642,11 @@ void SetAutoMine(bool bOn) { GAutoMine = bOn; }
 
 void Mine(bool bThenApplyChoice)
 {
+	if (GMineClosing.load() || IsEngineExitRequested() || BF6HP::Shared::CoreShuttingDown()) return;
 	if (GMining) { GApplyAfterMine |= bThenApplyChoice; return; }
 	// Never start core work once the add-on has begun going down: the join in
 	// Shutdown waits for what is already running, and a wait it can lose a race
 	// with is no wait.
-	if (BF6HP::Shared::CoreShuttingDown()) { return; }
 	const FString Level = BF6Ext::CurrentLevel();
 	if (Level.IsEmpty()) { BF6Ext::Notify(TEXT("Game modes: open a map first.")); return; }
 	const FString Install = InstallDir();
@@ -2659,6 +2664,9 @@ void Mine(bool bThenApplyChoice)
 		BF6Ext::Notify(FString::Printf(TEXT("Reading %s's game modes from the game..."), *Level));
 	}
 	const FString Dll = DllPath();
+	// Count the job before dispatch, so shutdown also sees work that has not
+	// yet entered its worker function.
+	GMineWorkers.fetch_add(1);
 	AsyncTask(ENamedThreads::AnyBackgroundThreadNormalTask, [Level, Install, Dll]{ MineOffThread(Level, Install, Dll); });
 }
 

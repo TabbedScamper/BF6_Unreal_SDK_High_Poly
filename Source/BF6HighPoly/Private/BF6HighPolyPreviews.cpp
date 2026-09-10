@@ -61,7 +61,7 @@ namespace
 	// pictures for ever while the build reports success over a folder it never
 	// rewrote. Continues the Godot plugin's numbering: 2 is the orthographic
 	// true isometric framed to the projected box.
-	const int32 kIconEpoch = 2;
+	const int32 kIconEpoch = 3; // Material palette colours and variation-scope recovery.
 
 	// (1, 1, 1) is the isometric axis proper: equal foreshortening on all three
 	// axes, the angle a parts catalogue uses and the reason the result reads

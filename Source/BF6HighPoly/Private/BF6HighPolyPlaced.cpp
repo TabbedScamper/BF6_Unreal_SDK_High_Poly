@@ -24,6 +24,7 @@
 #include "Misc/ConfigCacheIni.h"
 #include "Misc/CoreDelegates.h"
 #include "Misc/AutomationTest.h"
+#include "ProfilingDebugging/CpuProfilerTrace.h"
 #include "Misc/ScopeExit.h"
 #include "Misc/Paths.h"
 #include "HAL/IConsoleManager.h"
@@ -810,6 +811,12 @@ namespace PlacedImpl
 			D.Pos.Reserve(Base + S.Pos.Num());
 			D.Nrm.Reserve(Base + S.Pos.Num());
 			D.UV.Reserve(Base + S.Pos.Num());
+			if (!S.Colors.IsEmpty() || !D.Colors.IsEmpty())
+			{
+				while (D.Colors.Num() < Base) D.Colors.Add(FVector4f(1, 1, 1, 1));
+				for (int32 v = 0; v < S.Pos.Num(); ++v)
+					D.Colors.Add(S.Colors.IsValidIndex(v) ? S.Colors[v] : FVector4f(1, 1, 1, 1));
+			}
 			for (int32 v = 0; v < S.Pos.Num(); v++)
 			{
 				const FVector3f& P = S.Pos[v];
@@ -2115,6 +2122,7 @@ namespace PlacedImpl
 	// toggling its render state every frame.
 	void UpdateDistanceSwap()
 	{
+		TRACE_CPUPROFILER_EVENT_SCOPE(BF6PlacedDistanceSwap);
 		if (!GEnabled || GRecords.Num() == 0) { return; }
 		TArray<FVector> Cameras;
 		BF6Ext::GetBuildViewportLocations(Cameras);
@@ -2563,6 +2571,7 @@ namespace PlacedImpl
 
 	bool Tick(float)
 	{
+		TRACE_CPUPROFILER_EVENT_SCOPE(BF6PlacedTick);
 		// BEFORE THE ENABLED GATE, ALWAYS. Outstanding core work is owed a
 		// completion whatever the view is doing; the switch below hides objects,
 		// it does not cancel a mount that is already inside the core. This line
@@ -2622,6 +2631,9 @@ namespace PlacedImpl
 			GSelectionDirty = true;
 		}
 		const int32 Mode = BF6HP::Shared::Mode();
+		// Low Poly has no pending dress to finish. Leaving priority latched from
+		// OnMapOpened starves optional readers (including UI artwork) forever.
+		BF6HP::Shared::SetGeometryPriority(Mode != 0 && GEnabled && !GSummarySaid);
 		if (Mode != GLastMode) { GLastMode = Mode; GSelectionDirty = true; }
 		if (GSelectionDirty)
 		{
@@ -2963,7 +2975,7 @@ namespace PlacedImpl
 		if (GMapOpenedAt <= 0.0) GMapOpenedAt = FPlatformTime::Seconds();
 		// The scene is what the creator is waiting for. Optional reader work
 		// stands off until it is dressed; see SetGeometryPriority.
-		BF6HP::Shared::SetGeometryPriority(true);
+		BF6HP::Shared::SetGeometryPriority(BF6HP::Shared::Mode() != 0 && GEnabled);
 		GPreviewSelected = false;   // a scene change drops the override, as the Godot panel does
 		GLastMode = -1;
 		GForcePoll = true;
@@ -3218,6 +3230,7 @@ namespace Placed
 		{
 			if (!GEnabled) { return; }
 			GEnabled = false;
+			BF6HP::Shared::SetGeometryPriority(false);
 			ClearAll();
 			return;
 		}

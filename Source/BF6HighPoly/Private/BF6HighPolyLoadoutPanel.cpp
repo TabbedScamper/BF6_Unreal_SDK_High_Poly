@@ -10,12 +10,42 @@
 #include "Widgets/Views/SListView.h"
 #include "Widgets/Text/STextBlock.h"
 #include "Framework/Application/SlateApplication.h"
+#include "Widgets/Images/SImage.h"
+#include "Engine/Texture2D.h"
+#include "TextureResource.h"
+#include "UObject/StrongObjectPtr.h"
+#include "Containers/Ticker.h"
 
 namespace BF6HP::Loadout
 {
 namespace
 {
 	using FRow = TSharedPtr<FChoice>;
+	class SChoiceImage : public SCompoundWidget
+	{
+	public:
+		SLATE_BEGIN_ARGS(SChoiceImage) {} SLATE_END_ARGS()
+		void Construct(const FArguments&, TSharedPtr<const FChoiceIcon, ESPMode::ThreadSafe> Icon)
+		{
+			if (Icon && Icon->Width > 0 && Icon->Height > 0 && Icon->Pixels.Num() == Icon->Width * Icon->Height)
+			{
+				Texture.Reset(UTexture2D::CreateTransient(Icon->Width, Icon->Height, PF_B8G8R8A8));
+				if (Texture.IsValid())
+				{
+					Texture->SRGB = true;
+					void* Data = Texture->GetPlatformData()->Mips[0].BulkData.Lock(LOCK_READ_WRITE);
+					FMemory::Memcpy(Data, Icon->Pixels.GetData(), Icon->Pixels.Num() * sizeof(FColor));
+					Texture->GetPlatformData()->Mips[0].BulkData.Unlock(); Texture->UpdateResource();
+					Brush.SetResourceObject(Texture.Get()); Brush.ImageSize = FVector2D(Icon->Width, Icon->Height);
+				}
+			}
+			ChildSlot[SNew(SBox).WidthOverride(100).HeightOverride(60).HAlign(HAlign_Center).VAlign(VAlign_Center)
+				[SNew(SImage).Image(Texture.IsValid() ? &Brush : nullptr)]];
+		}
+	private:
+		TStrongObjectPtr<UTexture2D> Texture;
+		FSlateBrush Brush;
+	};
 	class SChoicePicker : public SCompoundWidget
 	{
 	public:
@@ -38,7 +68,13 @@ namespace
 			+ SVerticalBox::Slot().FillHeight(1)
 			[SAssignNew(List, SListView<FRow>).ListItemsSource(&Rows).SelectionMode(ESelectionMode::Single)
 				.OnGenerateRow_Lambda([](FRow R, const TSharedRef<STableViewBase>& Owner)
-				{ return SNew(STableRow<FRow>, Owner).Padding(5)[SNew(STextBlock).Text(FText::FromString(R->Label)).ToolTipText(FText::FromString(R->Id))]; })
+				{
+					return SNew(STableRow<FRow>, Owner).Padding(5).ToolTipText(FText::FromString(R->Description.IsEmpty() ? R->Id : R->Description))
+					[SNew(SHorizontalBox)
+					+ SHorizontalBox::Slot().AutoWidth()[SNew(SChoiceImage, R->Icon)]
+					+ SHorizontalBox::Slot().FillWidth(1).VAlign(VAlign_Center).Padding(8, 0)
+					[SNew(STextBlock).Text(FText::FromString(R->Label)).AutoWrapText(true)]];
+				})
 				.OnSelectionChanged_Lambda([this](FRow R, ESelectInfo::Type How)
 				{
 					if (R && How != ESelectInfo::Direct) { const FChoice Chosen = *R; Pick(Chosen); FSlateApplication::Get().DismissAllMenus(); }
@@ -78,6 +114,7 @@ namespace
 		BF6Ext::FObjectPreview Object;
 		TSharedPtr<SVerticalBox> Fields;
 		FString Revision;
+		FString ActionStatus;
 		double LastRefresh = 0;
 		void AddField(const FString& Key, const FString& Label, const FString& Value)
 		{
@@ -151,6 +188,8 @@ namespace
 					AddField(TEXT("role"), TEXT("Pose"), R.Role);
 				}
 				AddField(TEXT("item"), TEXT("Weapon"), R.Item);
+				if (Object.Type == TEXT("LootSpawner"))
+					Fields->AddSlot().AutoHeight().Padding(0, 8)[WeaponPreviewWidget(Object)];
 				const TMap<FString,FString> AttachmentLabels{{TEXT("scp"),TEXT("Optic")},{TEXT("sca"),TEXT("Canted optic")},{TEXT("brl"),TEXT("Barrel")},{TEXT("mzl"),TEXT("Muzzle")},{TEXT("mag"),TEXT("Magazine")},{TEXT("amo"),TEXT("Ammunition")},{TEXT("erg"),TEXT("Ergonomics")},{TEXT("btm"),TEXT("Underbarrel")},{TEXT("top"),TEXT("Top rail")},{TEXT("lft"),TEXT("Left rail")},{TEXT("rgt"),TEXT("Right rail")}};
 				for (const TCHAR* Slot : {TEXT("scp"),TEXT("sca"),TEXT("brl"),TEXT("mzl"),TEXT("mag"),TEXT("amo"),TEXT("erg"),TEXT("btm"),TEXT("top"),TEXT("lft"),TEXT("rgt")})
 				{
@@ -173,18 +212,28 @@ namespace
 						const FString Hint = Action == TEXT("blocks") ? TEXT("Create the native SpawnLoot rule, or update its item while keeping your event and conditions.") : Action == TEXT("script") ? TEXT("Open the item, spawner ID, card widget names and callable spawn helper. Use them in your chosen event handler.") : TEXT("Edit a reusable card with an optional action button. Connect its exported blocks or script to proximity, buy stations, Gunmaster or your own logic.");
 						Fields->AddSlot().AutoHeight().Padding(0, 4)
 						[SNew(SButton).Text(FText::FromString(Label)).ToolTipText(FText::FromString(Hint))
-							.OnClicked_Lambda([ActorId, Action]
+							.OnClicked_Lambda([this, ActorId, Action]
 							{
-								FString Why; BF6Ext::OpenLootBinding(ActorId, Action, Why); if (!Why.IsEmpty()) BF6Ext::Notify(Why); return FReply::Handled();
+								const bool Opened = BF6Ext::OpenLootBinding(ActorId, Action, ActionStatus);
+								if (Opened)
+									FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda([](float)
+									{ BF6Ext::CloseAddonWindow(TEXT("HighPoly.Loadout")); return false; }));
+								return FReply::Handled();
 							})];
 					}
+					Fields->AddSlot().AutoHeight().Padding(0, 8)
+					[SNew(STextBlock).Text_Lambda([this]{ return FText::FromString(ActionStatus); }).AutoWrapText(true)];
 				}
 			}
 		}
 	};
 }
+TSharedRef<SWidget> ChoiceMenu(const TArray<FChoice>& Options, TFunction<void(const FChoice&)> OnPick)
+{
+	return SNew(SChoicePicker, Options, MoveTemp(OnPick));
+}
 void OpenPanel()
 {
-	BF6Ext::ShowAddonWindow(TEXT("HighPoly.Loadout"), TEXT("Loadout"), SNew(SLoadoutPanel), FVector2D(490, 740));
+	BF6Ext::ShowAddonWindow(TEXT("HighPoly.Loadout"), TEXT("Loadout"), SNew(SLoadoutPanel), FVector2D(620, 900));
 }
 }

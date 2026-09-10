@@ -176,7 +176,8 @@ namespace
 		if (Targets.Num() > 1) return FString();
 		return ExactLeaf(Cat.Ebx, TEXT("md_") + Leaf(Item.Id), Item.Asset);
 	}
-	bool ItemMesh(FCore& C, const FCatalogue& Cat, const FString& Id, const TMap<FString,FString>& Attachments, TArray<FCore::FSection>& Out, FString& Error)
+	bool ItemMesh(FCore& C, const FCatalogue& Cat, const FString& Id, const TMap<FString,FString>& Attachments, TArray<FCore::FSection>& Out, FString& Error,
+		TMap<FString, FVector3f>* Anchors = nullptr)
 	{
 		const FChoice* Item = Cat.Items.FindByPredicate([&](const FChoice& I){ return I.Id == Id; });
 		if (!Item) { Error = TEXT("This item is absent from the installed equipment catalogue."); return false; }
@@ -210,6 +211,30 @@ namespace
 		TArray<FPart> Copy;
 		for (int32 I = 0; I < Count; ++I) if (Parts[I].mesh)
 			Copy.Add({ UTF8_TO_TCHAR(Parts[I].mesh), Parts[I].bundle ? UTF8_TO_TCHAR(Parts[I].bundle) : FString(), Matrix(Parts[I].attach_transform), Parts[I].has_attach_transform != 0 });
+		if (Anchors && BoneCount > 0)
+		{
+			const auto ReadSkeleton = Export<decltype(&bf6_skeleton_read)>(C, TEXT("bf6_skeleton_read"));
+			const auto Free = Export<decltype(&bf6_free)>(C, TEXT("bf6_free"));
+			if (ReadSkeleton && Free)
+			{
+				bf6_skeleton* S = ReadSkeleton(C.Handle(), "common/characters/_soldier/_weaponskeleton");
+				if (S)
+				{
+					const TMap<FString, FString> Slots{{TEXT("Wep_Scope_ATT"),TEXT("scp")}, {TEXT("Wep_SecondarySight_ATT"),TEXT("sca")},
+						{TEXT("Wep_Barrel_ATT"),TEXT("brl")}, {TEXT("Wep_Muzzle_ATT"),TEXT("mzl")},
+						{TEXT("Wep_MGZ_ATT"),TEXT("mag")}, {TEXT("Wep_UnderBarrel_ATT"),TEXT("btm")}};
+					for (int32 I = 0; I < FMath::Min(S->bone_count, BoneCount); ++I)
+						if (S->bones[I].name) if (const FString* Slot = Slots.Find(UTF8_TO_TCHAR(S->bones[I].name)))
+						{
+							// Undo the bind inverse in the configured skin matrix to
+							// recover this weapon's actual current socket position.
+							const FVector3f P = (Matrix(S->bones[I].inverse).Inverse() * Skin[I]).GetOrigin();
+							if (!P.ContainsNaN()) Anchors->Add(*Slot, P);
+						}
+					Free(C.Handle(), S);
+				}
+			}
+		}
 		for (const FPart& P : Copy)
 		{
 			TArray<FCore::FSection> S;
@@ -328,7 +353,7 @@ FDecoded Decode(FCore& C, const FCatalogue& Cat, const FRequest& R)
 	FDecoded Out;
 	if (R.Type == TEXT("LootSpawner"))
 	{
-		if (!ItemMesh(C, Cat, R.Item, R.Attachments, Out.Sections, Out.Error)) Out.Sections.Reset();
+		if (!ItemMesh(C, Cat, R.Item, R.Attachments, Out.Sections, Out.Error, &Out.SlotAnchors)) Out.Sections.Reset();
 		return Out;
 	}
 	if (R.Type.StartsWith(TEXT("VEH_")) || R.Type == TEXT("VehicleSpawner"))

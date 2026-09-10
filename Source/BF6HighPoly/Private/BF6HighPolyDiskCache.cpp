@@ -8,6 +8,7 @@
 #include "Misc/Paths.h"
 #include "Misc/ScopeLock.h"
 #include "Misc/SecureHash.h"
+#include <atomic>
 
 DEFINE_LOG_CATEGORY_STATIC(LogBF6DiskCache, Log, All);
 
@@ -23,6 +24,7 @@ namespace BF6HP::DiskCache
 		FCriticalSection GSignatureLock;
 		FCriticalSection GPendingLock;
 		TArray<TFuture<void>> GPending;
+		std::atomic<int64> GPendingBytes{0};
 
 		constexpr uint32 kMagic = 0x43364642; // 'BF6C' little-endian
 		constexpr uint32 kCodecRaw = 0, kCodecOodle = 1;
@@ -255,9 +257,23 @@ namespace BF6HP::DiskCache
 		if (InstallSignature().IsEmpty()) return;
 		const FString Path = PathFor(Level, Name);
 		if (Path.IsEmpty()) return;
+		// Derived writes are optional. Do not retain an unbounded queue of raw
+		// meshes/textures when the build outruns compression on a six-core CPU.
+		// Skipping a write means a later cache miss, never a missing scene asset.
+		constexpr int64 Budget = 128ll * 1024 * 1024;
+		const int64 Size = Bytes.Num();
+		int64 Pending = GPendingBytes.load();
+		do
+		{
+			if (Size > Budget || Pending > Budget - Size)
+			{
+				FScopeLock G(&GStatsLock); ++GStats.WritesSkipped;
+				return;
+			}
+		} while (!GPendingBytes.compare_exchange_weak(Pending, Pending + Size));
 		TArray<uint8> Owned = MoveTemp(Bytes);
 		TFuture<void> F = Async(EAsyncExecution::ThreadPool,
-			[Path, Version, bPack, Owned = MoveTemp(Owned)]() mutable
+			[Path, Version, bPack, Size, Owned = MoveTemp(Owned)]() mutable
 			{
 				const double T0 = FPlatformTime::Seconds();
 				if (bPack)
@@ -270,6 +286,8 @@ namespace BF6HP::DiskCache
 				{
 					WriteFile(Path, Version, Owned);
 				}
+				Owned.Empty();
+				GPendingBytes -= Size;
 				FScopeLock G(&GStatsLock);
 				GStats.SecondsSaving += FPlatformTime::Seconds() - T0;
 			});

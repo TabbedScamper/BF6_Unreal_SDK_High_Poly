@@ -28,7 +28,7 @@ namespace
 		FRequest Request;
 		bool HiddenProxy = false, Near = false;
 	};
-	struct FAsset { UStaticMesh* Mesh = nullptr; FString Error, Detail; };
+	struct FAsset { UStaticMesh* Mesh = nullptr; FString Error, Detail; TMap<FString, FVector3f> SlotAnchors; };
 	struct FJob
 	{
 		FString Key, Error;
@@ -46,6 +46,8 @@ namespace
 	bool NeedCatalogue = false, Closing = false, OwnBusy = false;
 	double LastPoll = 0;
 	FString LastError;
+	FString PreviewDemandId;
+	double LastPreviewDemand = 0;
 	FString TypeOf(AActor* A)
 	{
 		for (const TCHAR* Prefix : {TEXT("type:"), TEXT("label:")})
@@ -88,6 +90,7 @@ namespace
 	}
 	void ClearRecords()
 	{
+		PreviewDemandId.Reset(); LastPreviewDemand = 0;
 		for (FRecord& R : Records) Release(R);
 		Records.Reset(); LastPoll = 0;
 		for (auto& Pair : Assets) if (Pair.Value.Mesh) Pair.Value.Mesh->RemoveFromRoot();
@@ -187,6 +190,7 @@ namespace
 			FAsset& Asset = Assets.FindOrAdd(Result->Key);
 			Asset.Error = Result->Error.IsEmpty() ? Result->Decoded.Error : Result->Error;
 			Asset.Detail = Result->Decoded.Detail;
+			Asset.SlotAnchors = MoveTemp(Result->Decoded.SlotAnchors);
 			if (Asset.Error.IsEmpty() && Result->Work.IsValid())
 			{
 				// All native reads have finished. Hold the same lock for material
@@ -259,7 +263,13 @@ namespace
 			Show(R, High);
 		}
 		if (Worker.IsValid() || (Shared::IsBuilding() && !FinishingBuild) || Shared::CoreBusy()) return true;
-		FRecord* Next = Enabled ? Records.FindByPredicate([](const FRecord& R){ return !R.Wanted.IsEmpty() && !Assets.Contains(R.Wanted); }) : nullptr;
+		// A visible loadout menu may request its one selected item while the map
+		// stays in Low Poly. Opening that menu must not dress every scene spawner.
+		FRecord* Next = Records.FindByPredicate([&](const FRecord& R)
+		{
+			const bool Demanded = Now - LastPreviewDemand < 2 && R.Actor.IsValid() && R.Actor->GetPathName() == PreviewDemandId;
+			return (Enabled || Demanded) && !R.Wanted.IsEmpty() && !Assets.Contains(R.Wanted);
+		});
 		if (!Next && (!NeedCatalogue || Catalogue)) return true;
 		FString Error;
 		if (!Shared::EnsureCoreOpen(Error)) { LastError = Error; NeedCatalogue = false; return true; }
@@ -295,9 +305,18 @@ FString SelectionStatus(const FString& Id)
 	for (const FRecord& R : Records) if (R.Actor.IsValid() && R.Actor->GetPathName() == Id)
 	{
 		if (!R.Error.IsEmpty()) return R.Error;
+		if (const FAsset* Asset = Assets.Find(R.Wanted)) if (Asset->Mesh) return TEXT("Preview ready");
 		return R.Wanted == R.Installed ? TEXT("Preview ready") : TEXT("Preview queued");
 	}
 	return TEXT("Select a soldier, loot or vehicle spawner.");
+}
+UStaticMesh* PreviewMesh(const FString& Id, TMap<FString, FVector3f>& OutAnchors)
+{
+	OutAnchors.Reset();
+	PreviewDemandId = Id; LastPreviewDemand = FPlatformTime::Seconds();
+	for (const FRecord& R : Records) if (R.Actor.IsValid() && R.Actor->GetPathName() == Id)
+		if (const FAsset* Asset = Assets.Find(R.Wanted)) { OutAnchors = Asset->SlotAnchors; return Asset->Mesh; }
+	return nullptr;
 }
 TArray<FChoice> Choices(const FString& Field, const BF6Ext::FObjectPreview& Object)
 {
@@ -338,6 +357,7 @@ TArray<FChoice> Choices(const FString& Field, const BF6Ext::FObjectPreview& Obje
 void Start()
 {
 	Closing = false;
+	StartEquipmentCards();
 	// ShutdownModule runs after the UObject system has closed during editor
 	// exit. Release rooted previews while those objects are still alive.
 	PreExit = FCoreDelegates::OnEnginePreExit.AddStatic(&Stop);
@@ -360,6 +380,7 @@ void Stop()
 	if (Closing) return;
 	FCoreDelegates::OnEnginePreExit.Remove(PreExit); PreExit.Reset();
 	Closing = true;
+	StopEquipmentCards();
 	if (Ticker.IsValid()) FTSTicker::GetCoreTicker().RemoveTicker(Ticker);
 	if (MapClose.IsValid()) BF6Ext::OnMapClosing().Remove(MapClose);
 	BF6Ext::CloseAddonWindow(TEXT("HighPoly.Loadout"));

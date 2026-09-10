@@ -48,6 +48,7 @@ namespace BF6HP
 		// Load the dll and open the install. False with Error set.
 		bool Open(const FString& GameDir, const FString& DllPath);
 		bool IsOpen() const { return Ctx != nullptr; }
+		const FGuid& TextureNamespace() const { return TextureSession; }
 
 		// Mount a level and walk it. Seconds, not milliseconds: the mount and
 		// the partition index dominate. Cached in the core per level.
@@ -133,6 +134,8 @@ namespace BF6HP
 		{
 			TArray<FVector3f> Pos, Nrm;
 			TArray<FVector2f> UV;
+			// Linear surface palette multipliers. Empty means neutral white.
+			TArray<FVector4f> Colors;
 			TArray<uint32>    Idx;
 			TArray<FBinding>  Textures;
 			// From the shader's own record, not guessed from the textures.
@@ -173,7 +176,7 @@ namespace BF6HP
 		bool ReadMesh(const FString& ResName, TArray<FSection>& Out,
 		              const FString& PlacingBundle = FString(),
 		              const FString& Variation = FString(),
-		              const TArray<FMatrix44f>* Skin = nullptr, int32 RigBoneCount = 0);
+		              const TArray<FMatrix44f>* Skin = nullptr, int32 RigBoneCount = 0, int32 Lod = 0);
 
 		// One decoded texture, still block-compressed.
 		struct FTexture
@@ -189,6 +192,8 @@ namespace BF6HP
 		// authored mip that fits instead of decoding a full sheet for the caller
 		// to throw away. Zero keeps the original full-resolution path.
 		bool TextureAt(int32 Id, FTexture& Out, int32 MaxDim = 0);
+		// Call only after copying the borrowed capped TextureAt view.
+		void ReleaseTexturePayload(int32 Id, int32 MaxDim);
 		// Register a standalone texture RESOURCE by its live install name. This is
 		// how VisualEnvironment textures that are not material bindings (flow
 		// masks, cloud shadows and grading LUTs) enter the same direct decode path.
@@ -779,6 +784,7 @@ namespace BF6HP
 	private:
 		void*    Dll = nullptr;
 		bf6_ctx* Ctx = nullptr;
+		FGuid TextureSession = FGuid::NewGuid();
 		// WHICH INSTALL THIS CONTEXT IS READING.
 		//
 		// Open returned early whenever a context existed, without comparing the

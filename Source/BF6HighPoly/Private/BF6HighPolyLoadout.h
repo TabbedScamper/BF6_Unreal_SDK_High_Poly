@@ -3,11 +3,20 @@
 #include "BF6HighPolyCore.h"
 #include "BF6SDKExtension.h"
 
+class UStaticMesh;
+
 namespace BF6HP::Loadout
 {
+	struct FChoiceIcon
+	{
+		int32 Width = 0, Height = 0;
+		TArray<FColor> Pixels;
+	};
 	struct FChoice
 	{
 		FString Id, Label, Group, Asset, Bundle, Variation;
+		FString Description;
+		TSharedPtr<const FChoiceIcon, ESPMode::ThreadSafe> Icon;
 	};
 	struct FCatalogue
 	{
@@ -28,6 +37,7 @@ namespace BF6HP::Loadout
 	{
 		TArray<FCore::FSection> Sections;
 		FString Error, Detail;
+		TMap<FString, FVector3f> SlotAnchors;
 	};
 	// Reader calls are made on one owned worker while holding CoreMutex.
 	TSharedPtr<FCatalogue, ESPMode::ThreadSafe> ReadCatalogue(FCore& Core, FString& Error);
@@ -37,10 +47,15 @@ namespace BF6HP::Loadout
 	FRequest RequestFor(const FString& Type, const TMap<FString, FString>& Values);
 	void Start();
 	void Stop();
+	void StartEquipmentCards();
+	void StopEquipmentCards();
 	void OpenPanel();
 	TArray<FChoice> Choices(const FString& Field, const BF6Ext::FObjectPreview& Object);
 	FString Status();
 	FString SelectionStatus(const FString& Id);
 	void RequestCatalogue();
 	bool FinishBuildStep(int32& Done, int32& Total);
+	UStaticMesh* PreviewMesh(const FString& Id, TMap<FString, FVector3f>& OutAnchors);
+	TSharedRef<SWidget> WeaponPreviewWidget(const BF6Ext::FObjectPreview& Object);
+	TSharedRef<SWidget> ChoiceMenu(const TArray<FChoice>& Options, TFunction<void(const FChoice&)> OnPick);
 }

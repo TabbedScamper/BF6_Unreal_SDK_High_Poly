@@ -3,6 +3,8 @@
 
 #include "BF6SDKExtension.h"
 #include "BF6HighPolyCore.h"
+#include "BF6HighPolyTextureStreaming.h"
+#include "BF6HighPolyPerformance.h"
 #include "BF6HighPolyLoadout.h"
 #include "BF6HighPolyTerrainBridge.h"
 #include "BF6HighPolyControlBridge.h"
@@ -15,6 +17,9 @@
 #include "Async/ParallelFor.h"
 #include <atomic>
 #include "Misc/ScopedSlowTask.h"
+#if WITH_DEV_AUTOMATION_TESTS
+#include "Misc/AutomationTest.h"
+#endif
 #include "Framework/Application/SlateApplication.h"
 #include "TimerManager.h"
 #include "Containers/Ticker.h"
@@ -29,6 +34,7 @@
 #include "Components/SpotLightComponent.h"
 #include "Components/RectLightComponent.h"
 #include "Components/SkyLightComponent.h"
+#include "UObject/StrongObjectPtr.h"
 #include "Components/DirectionalLightComponent.h"
 #include "Components/ExponentialHeightFogComponent.h"
 #include "Components/SkyAtmosphereComponent.h"
@@ -120,6 +126,8 @@
 #include "Widgets/Text/STextBlock.h"
 #include "Styling/AppStyle.h"
 #include "Misc/Paths.h"
+#include "Dom/JsonObject.h"
+#include "Serialization/JsonSerializer.h"
 
 DEFINE_LOG_CATEGORY_STATIC(LogBF6HighPoly, Log, All);
 
@@ -135,6 +143,7 @@ namespace
 	FString      GStatus = TEXT("");
 	int32        GLastCount = 0;
 	std::atomic<bool> GBuildQueuedOrRunning{ false };
+	bool GTestBuildCompleted = false;
 	// DID THE BUILD PRODUCE ANYTHING AT ALL.
 	//
 	// Not the same question as GLastCount, which counts placed OBJECT
@@ -206,7 +215,20 @@ namespace
 		}
 	}
 
-	TMap<uint64, UTexture2D*> GTextureCache;
+	// Cached transient objects must remain reachable even before a mesh or
+	// material references them. Raw pointers here survived GC as dangling hits.
+	struct FTextureCacheKey
+	{
+		uint64 IdAndSize;
+		FGuid Core;
+		FTextureCacheKey(uint64 InIdAndSize, const BF6HP::FCore* InCore = &GCore)
+			: IdAndSize(InIdAndSize), Core(InCore->TextureNamespace()) {}
+		bool operator==(const FTextureCacheKey& Other) const
+		{ return IdAndSize == Other.IdAndSize && Core == Other.Core; }
+		friend uint32 GetTypeHash(const FTextureCacheKey& Key)
+		{ return HashCombineFast(::GetTypeHash(Key.IdAndSize), GetTypeHash(Key.Core)); }
+	};
+	TMap<FTextureCacheKey, TStrongObjectPtr<UTexture2D>> GTextureCache;
 	int32 GTexUploaded = 0, GTexHighQuality = 0, GTexRefused = 0;
 	int32 GMidsMade = 0, GBindingsSeen = 0, GBindingsBound = 0;
 	double GSecObjectMaterials = 0.0, GSecObjectPrepare = 0.0;
@@ -232,6 +254,8 @@ namespace
 	// every material binding while avoiding the upload that drove Tsuru above
 	// 60 GB.  The data still comes directly from the mounted game at runtime.
 	int32 GPreviewTextureMax = 1024;
+	TAutoConsoleVariable<int32> CVarTextureStreaming(TEXT("BF6.HighPoly.TextureStreaming"), 1,
+		TEXT("Stream authored texture mips from session backing storage. Change before building."));
 	// Paint is a tiny, visually critical subset. Keep its complete authored top
 	// mip rather than paying the whole-map memory cost. 16384 means "full" for
 	// the runtime API; it does not upscale a sheet whose authored top is smaller.
@@ -330,7 +354,8 @@ namespace
 		if (Id < 0) return nullptr;
 		const int32 MaxDim = RequestedMax > 0 ? RequestedMax : GPreviewTextureMax;
 		const uint64 CacheKey = ((uint64)(uint32)Id << 32) | (uint32)MaxDim;
-		if (UTexture2D** hit = GTextureCache.Find(CacheKey)) return *hit;
+		const FTextureCacheKey ScopedKey(CacheKey, &SourceCore);
+		if (const auto* Hit = GTextureCache.Find(ScopedKey)) return Hit->Get();
 
 		// THE PAYLOAD: the batch prefetch, else the disk cache, else the core.
 		const double DecodeStart = FPlatformTime::Seconds();
@@ -357,11 +382,12 @@ namespace
 			if (!SourceCore.TextureAt(Id, T, MaxDim))
 			{
 				GSecTexDecode += FPlatformTime::Seconds() - DecodeStart;
-				GTexRefused++; GTextureCache.Add(CacheKey, nullptr); return nullptr;
+				GTexRefused++; GTextureCache.Add(ScopedKey, TStrongObjectPtr<UTexture2D>()); return nullptr;
 			}
 			P.Width = T.Width; P.Height = T.Height; P.Format = T.Format;
 			P.MipCount = T.MipCount; P.bSrgb = T.bSrgb;
 			P.Data.Append(T.Data, T.DataLen);
+			SourceCore.ReleaseTexturePayload(Id, MaxDim);
 			// Written behind the build, packed on the worker. An older core that
 			// cannot name the resource gets no blob rather than an unkeyable one.
 			if (!ResName.IsEmpty() && P.Data.Num() > 0)
@@ -378,7 +404,7 @@ namespace
 
 		const double UploadStart = FPlatformTime::Seconds();
 		const EPixelFormat PF = PixelFormatOf(P.Format);
-		if (PF == PF_Unknown) { GTexRefused++; GTextureCache.Add(CacheKey, nullptr); return nullptr; }
+		if (PF == PF_Unknown) { GTexRefused++; GTextureCache.Add(ScopedKey, TStrongObjectPtr<UTexture2D>()); return nullptr; }
 
 		// THE WHOLE CHAIN, not just the top level.
 		//
@@ -387,7 +413,8 @@ namespace
 		// moth-eaten" look. It is invariant to mask resolution, so shrinking the
 		// texture never fixes it and the mask gets blamed instead.
 		UTexture2D* Tex = UTexture2D::CreateTransient(P.Width, P.Height, PF, NAME_None);
-		if (!Tex) { GTextureCache.Add(CacheKey, nullptr); return nullptr; }
+		if (!Tex) { GTextureCache.Add(ScopedKey, TStrongObjectPtr<UTexture2D>()); return nullptr; }
+		TStrongObjectPtr<UTexture2D> KeepTexture(Tex);
 		GTexUploaded++;
 		if (MaxDim > GPreviewTextureMax) GTexHighQuality++;
 
@@ -423,6 +450,36 @@ namespace
 			: (P.bSrgb ? TC_Default : TC_Masks);
 
 		FTexturePlatformData* PD = Tex->GetPlatformData();
+		// Describe every mip before attaching the provider. Its backing file is
+		// session-owned and does not require a warm derived cache or a live reader.
+		int32 MipW = P.Width, MipH = P.Height;
+		int64 PayloadBytes = 0;
+		for (int32 M = 0; M < P.MipCount; ++M)
+		{
+			PayloadBytes += MipBytes(PF, MipW, MipH);
+			if (PayloadBytes > P.Data.Num()) break;
+			if (M >= PD->Mips.Num()) PD->Mips.Add(new FTexture2DMipMap());
+			PD->Mips[M].SizeX = MipW;
+			PD->Mips[M].SizeY = MipH;
+			PD->Mips[M].SizeZ = 1;
+			MipW = FMath::Max(1, MipW / 2); MipH = FMath::Max(1, MipH / 2);
+		}
+		if (CVarTextureStreaming.GetValueOnGameThread() != 0 &&
+			UBF6HighPolyMipProvider::Attach(Tex, P.Data))
+		{
+			for (FTexture2DMipMap& Mip : PD->Mips) Mip.BulkData.RemoveBulkData();
+			Tex->UpdateResource();
+			GSecTexUpload += FPlatformTime::Seconds() - UploadStart;
+			GTextureCache.Add(ScopedKey, MoveTemp(KeepTexture));
+			return Tex;
+		}
+		// A storage failure keeps the established fully resident path usable.
+		for (FTexture2DMipMap& Mip : PD->Mips)
+		{
+			Mip.BulkData.Lock(LOCK_READ_WRITE);
+			Mip.BulkData.Realloc(MipBytes(PF, Mip.SizeX, Mip.SizeY));
+			Mip.BulkData.Unlock();
+		}
 
 		// CreateTransient makes one mip; the rest are added here and filled from
 		// the chain the core handed over, which is contiguous and largest-first.
@@ -460,7 +517,7 @@ namespace
 		Tex->UpdateResource();
 		GSecTexUpload += FPlatformTime::Seconds() - UploadStart;
 
-		GTextureCache.Add(CacheKey, Tex);
+		GTextureCache.Add(ScopedKey, MoveTemp(KeepTexture));
 		return Tex;
 	}
 
@@ -474,15 +531,15 @@ namespace
 	// size squared and whose height is size. This only changes the resource
 	// SHAPE: the installed bytes are copied unchanged and no colour conversion,
 	// resampling, export or generated intermediate exists.
-	TMap<int32, UTexture2D*> GColorLutCache;
+	TMap<int32, TStrongObjectPtr<UTexture2D>> GColorLutCache;
 	UTexture2D* TextureForColorLut(int32 Id)
 	{
 		if (Id < 0) return nullptr;
-		if (UTexture2D** Hit = GColorLutCache.Find(Id)) return *Hit;
+		if (const auto* Hit = GColorLutCache.Find(Id)) return Hit->Get();
 		BF6HP::FCore::FTexture T;
 		if (!GCore.TextureAt(Id, T, 0) || T.Width <= 1 || T.Width != T.Height)
 		{
-			GColorLutCache.Add(Id, nullptr);
+			GColorLutCache.Add(Id, TStrongObjectPtr<UTexture2D>());
 			return nullptr;
 		}
 		const int64 Side = T.Width;
@@ -492,12 +549,13 @@ namespace
 			UE_LOG(LogBF6HighPoly, Log,
 				TEXT("grading LUT %d is %dx%d/%d bytes, not a raw R10G10B10A2 cube"),
 				Id, T.Width, T.Height, T.DataLen);
-			GColorLutCache.Add(Id, nullptr);
+			GColorLutCache.Add(Id, TStrongObjectPtr<UTexture2D>());
 			return nullptr;
 		}
 		UTexture2D* Lut = UTexture2D::CreateTransient(
 			T.Width * T.Width, T.Height, PF_A2B10G10R10, NAME_None);
-		if (!Lut) { GColorLutCache.Add(Id, nullptr); return nullptr; }
+		if (!Lut) { GColorLutCache.Add(Id, TStrongObjectPtr<UTexture2D>()); return nullptr; }
+		TStrongObjectPtr<UTexture2D> KeepLut(Lut);
 		Lut->SRGB = false;
 		Lut->NeverStream = true;
 		Lut->Filter = TF_Bilinear;
@@ -508,7 +566,7 @@ namespace
 		FTexturePlatformData* PD = Lut->GetPlatformData();
 		if (!PD || PD->Mips.IsEmpty())
 		{
-			GColorLutCache.Add(Id, nullptr);
+			GColorLutCache.Add(Id, TStrongObjectPtr<UTexture2D>());
 			return nullptr;
 		}
 		FTexture2DMipMap& Mip = PD->Mips[0];
@@ -516,7 +574,7 @@ namespace
 		FMemory::Memcpy(Dst, T.Data, T.DataLen);
 		Mip.BulkData.Unlock();
 		Lut->UpdateResource();
-		GColorLutCache.Add(Id, Lut);
+		GColorLutCache.Add(Id, MoveTemp(KeepLut));
 		return Lut;
 	}
 
@@ -546,7 +604,7 @@ namespace
 	// sheet on every surface would add a texture fetch to the entire map for the
 	// sake of the small set of records that bind the game's real glow slot.
 	UMaterial* GEmissiveParents[(int32)EKind::Count] = {};
-	TMap<FString, UMaterialInstanceDynamic*> GMaterialCache;
+	TMap<FString, TStrongObjectPtr<UMaterialInstanceDynamic>> GMaterialCache;
 	int32 GMaterialCacheHits = 0, GMaterialCacheMisses = 0;
 
 	// ONE PARENT MATERIAL, BUILT ONCE, AT RUNTIME.
@@ -618,6 +676,24 @@ namespace
 		T->AddToRoot();
 		GLinearFlatNormal = T;
 		return T;
+	}
+
+	void CompileNewMaterial(UMaterial* Material)
+	{
+		check(IsInGameThread() && Material && Material->HasAnyFlags(RF_Transient));
+		// These graphs have never been assigned to a component. UE 5.8's normal
+		// PostEditChange compiles them and then recreates EVERY scene component,
+		// including the SDK's huge procedural meshes. Run the standard property
+		// preparation (including Substrate conversion) without that global rebuild,
+		// then compile this material with an explicit rendering synchronization.
+		FMaterialUpdateContext Update(FMaterialUpdateContext::EOptions::SyncWithRenderingThread);
+		Update.AddMaterial(Material);
+		FPropertyChangedEvent Prepared(nullptr, EPropertyChangeType::Interactive);
+		Material->PreEditChange(nullptr);
+		Material->PostEditChangeProperty(Prepared);
+		// None initializes a shader map without submitting its shader jobs. Queue
+		// them now so finalization can finish them before reporting the scene ready.
+		Material->ForceRecompileForRendering(EMaterialShaderPrecompileMode::Background);
 	}
 
 	UMaterial* EnsureParentMaterial(EKind Kind, bool bEmissive = false)
@@ -911,7 +987,17 @@ namespace
 		if (Kind != EKind::Puddle && Base && Mul && Tint)
 		{
 			UMaterialEditingLibrary::ConnectMaterialExpressions(Base, TEXT(""), Mul, TEXT("A"));
-			UMaterialEditingLibrary::ConnectMaterialExpressions(Tint, TEXT(""), Mul, TEXT("B"));
+			if (Kind == EKind::Opaque || Kind == EKind::Masked || Kind == EKind::MaskedVeg)
+			{
+				auto* VertexTint = Cast<UMaterialExpressionVertexColor>(UMaterialEditingLibrary::CreateMaterialExpression(
+					M, UMaterialExpressionVertexColor::StaticClass(), -700, 340));
+				auto* PaletteTint = Cast<UMaterialExpressionMultiply>(UMaterialEditingLibrary::CreateMaterialExpression(
+					M, UMaterialExpressionMultiply::StaticClass(), -450, 180));
+				UMaterialEditingLibrary::ConnectMaterialExpressions(Tint, TEXT(""), PaletteTint, TEXT("A"));
+				UMaterialEditingLibrary::ConnectMaterialExpressions(VertexTint, TEXT("RGB"), PaletteTint, TEXT("B"));
+				UMaterialEditingLibrary::ConnectMaterialExpressions(PaletteTint, TEXT(""), Mul, TEXT("B"));
+			}
+			else UMaterialEditingLibrary::ConnectMaterialExpressions(Tint, TEXT(""), Mul, TEXT("B"));
 			UMaterialEditingLibrary::ConnectMaterialProperty(Mul, TEXT(""), MP_BaseColor);
 		}
 		else if (Kind != EKind::Puddle && Base)
@@ -1388,20 +1474,13 @@ namespace
 			UMaterialEditingLibrary::ConnectMaterialProperty(Opacity,TEXT(""),MP_Opacity);
 		}
 
-		// PostEditChange is what a properly-packaged material needs to cache its
-		// shaders. RecompileMaterial is deliberately NOT called: it crashed
-		// here, and it is the heavyweight path meant for an asset being edited.
 		// Full-map objects are emitted through HISM components. Compile that
 		// permutation with the reusable parent instead of letting the first placed
 		// instance request it after the map has already started rendering.
-		M->PreEditChange(nullptr);
-		M->PostEditChange();
-		// SetMaterialUsage triggers a compile immediately. Calling it before
-		// PostEditChange made the compiler inspect an unfinished expression
-		// collection and reject even valid engine/default textures as unresolved.
-		// Finalize the graph first, then queue the HISM permutation while this
-		// synchronous build still has ample work left to overlap with it.
-		M->SetMaterialUsage(MATUSAGE_InstancedStaticMeshes);
+		// SetUsageByFlag records the requirement without compiling an unprepared
+		// graph. CompileNewMaterial prepares it and submits all required usages once.
+		M->SetUsageByFlag(MATUSAGE_InstancedStaticMeshes, true);
+		CompileNewMaterial(M);
 
 		UE_LOG(LogBF6HighPoly, Log,
 			TEXT("parent material %s: %d expression(s), complete=%d (compiling=%d)"), *ParentName,
@@ -1584,6 +1663,7 @@ namespace
 	                                      float RuntimeGlowStrength = 0.f,
 	                                      const FGlassDesc* Glass = nullptr)
 	{
+		(void)Outer; // Shared cache entries must not retain the first caller's world.
 		const double KeyStart = FPlatformTime::Seconds();
 		bool bHasAlbedo = false, bHasNormal = false;
 		bool bHasRealEmissive = false, bHasPlaceholderEmissive = false;
@@ -1645,20 +1725,23 @@ namespace
 				Bits(Glass->Tint.R), Bits(Glass->Tint.G), Bits(Glass->Tint.B),
 				Bits(Glass->Opacity), Bits(Glass->Smoothness));
 		GSecMaterialKey += FPlatformTime::Seconds() - KeyStart;
-		if (UMaterialInstanceDynamic** Cached = GMaterialCache.Find(Key))
+		if (const auto* Cached = GMaterialCache.Find(Key))
 		{
 			GMaterialCacheHits++;
-			return *Cached;
+			return Cached->Get();
 		}
 		GMaterialCacheMisses++;
 		const double ParentStart = FPlatformTime::Seconds();
 		UMaterial* Parent = EnsureParentMaterial(Kind, bHasEmissive);
 		GSecParentMaterials += FPlatformTime::Seconds() - ParentStart;
 		if (!Parent) return nullptr;
-		UMaterialInstanceDynamic* MID = UMaterialInstanceDynamic::Create(Parent, Outer);
+		// Cached MIDs retain their Outer. An actor/mesh Outer pins the old world
+		// and makes Unreal abort when loading another .umap.
+		UMaterialInstanceDynamic* MID = UMaterialInstanceDynamic::Create(Parent, GetTransientPackage());
 		if (!MID) return nullptr;
-		// The mesh outlives the call that made it, so the instance has to be
-		// rooted to the mesh rather than left for the next collection.
+		// Outer does not keep a child alive. Retain it during parameter setup
+		// and for as long as the reusable material cache owns this instance.
+		TStrongObjectPtr<UMaterialInstanceDynamic> KeepMaterial(MID);
 		MID->SetFlags(RF_Transient);
 		GMidsMade++;
 		// White and 0.5 are the parent's own defaults, so setting them anyway
@@ -1751,7 +1834,7 @@ namespace
 			default: break;   // mro: packed-channel parameters follow
 			}
 		}
-		GMaterialCache.Add(MoveTemp(Key), MID);
+		GMaterialCache.Add(MoveTemp(Key), MoveTemp(KeepMaterial));
 		GSecMidBuild += FPlatformTime::Seconds() - ParentStart;
 		return MID;
 	}
@@ -1944,6 +2027,16 @@ namespace
 	// path, and it runs for every distinct asset. That trade is the creator's
 	// to make, so it is a switch rather than a decision made here.
 	bool GNanite = true;
+	TAutoConsoleVariable<int32> CVarBuildBatch(TEXT("BF6.HighPoly.BuildBatch"), 0,
+		TEXT("Mesh preparation batch size. 0 adapts to installed RAM; 32..256 overrides."));
+	TAutoConsoleVariable<int32> CVarTerrainBatch(TEXT("BF6.HighPoly.TerrainBatch"), 16,
+		TEXT("Terrain tile preparation batch size, clamped to 4..256. Default 16 bounds temporary descriptions."));
+	FAutoConsoleCommand GNaniteCommand(TEXT("BF6.HighPoly.Nanite"), TEXT("on | off: applies to the next build."),
+		FConsoleCommandWithArgsDelegate::CreateLambda([](const TArray<FString>& Args)
+		{
+			if (Args.Num() == 1 && Args[0].Equals(TEXT("on"), ESearchCase::IgnoreCase)) GNanite = true;
+			else if (Args.Num() == 1 && Args[0].Equals(TEXT("off"), ESearchCase::IgnoreCase)) GNanite = false;
+		}));
 
 	// Set the mesh up WITHOUT building it. Building is what costs, and building
 	// one mesh at a time is what costs most: BatchBuild takes the whole set and
@@ -1962,6 +2055,12 @@ namespace
 	// useful work while avoiding thousands of tiny asynchronous builds that
 	// keep the editor busy long after the map first appears.
 	int32 GNaniteMinTris = 10000;
+	TAutoConsoleVariable<int32> CVarGameLODs(TEXT("BF6.HighPoly.GameLODs"), 0,
+		TEXT("Experimental authored LODs for conventional map props. 0 off, 1 on; rebuild to apply."));
+	TAutoConsoleVariable<int32> CVarCompactVertices(TEXT("BF6.HighPoly.CompactVertices"), 1,
+		TEXT("Share exactly matching render corners of the same source vertex. 0 provides the unshared comparison."));
+	std::atomic<int64> GRenderCornersBefore{0}, GRenderCornersAfter{0};
+	int32 GGameLodMeshes = 0, GGameLodRejected = 0;
 	int32 GNaniteCountThisBuild = 0;
 	int32 GRuntimeMeshCountThisBuild = 0;
 	int32 GNoNaniteTranslucent = 0;
@@ -2081,9 +2180,65 @@ namespace
 	// uses it because the tiles already provide culling; small/translucent props
 	// use it because the full path would not build Nanite for them anyway. Large
 	// opaque props retain the editor/Nanite path where its hierarchy is useful.
-	bool PrepareRuntimeRenderMesh(UStaticMesh* Mesh, FMeshDescription& MD, int32 Tris)
+	int32 CompactIdenticalCorners(FMeshDescription& MD)
 	{
+		// The fast builder emits one GPU vertex per vertex instance. Our triangle
+		// descriptions can contain six identical corners for one source vertex.
+		// Share only exact attribute matches after tangent generation. Do not weld
+		// positions, average normals, quantize UVs, or cross authored vertex seams.
+		if (MD.VertexInstances().Num() <= MD.Vertices().Num()) return 0;
+		FStaticMeshAttributes A(MD);
+		auto Normals = A.GetVertexInstanceNormals();
+		auto Tangents = A.GetVertexInstanceTangents();
+		auto Signs = A.GetVertexInstanceBinormalSigns();
+		auto UVs = A.GetVertexInstanceUVs();
+		auto Colors = A.GetVertexInstanceColors();
+		TArray<FVertexInstanceID> Remap; Remap.SetNumUninitialized(MD.VertexInstances().GetArraySize());
+		TArray<FVertexInstanceID> Removed;
+		for (FVertexID V : MD.Vertices().GetElementIDs())
+		{
+			TArray<FVertexInstanceID, TInlineAllocator<8>> Unique;
+			for (FVertexInstanceID VI : MD.GetVertexVertexInstanceIDs(V))
+			{
+				FVertexInstanceID Match = VI;
+				for (FVertexInstanceID Other : Unique)
+				{
+					if (Normals[VI] != Normals[Other] || Tangents[VI] != Tangents[Other] ||
+						Signs[VI] != Signs[Other] || Colors[VI] != Colors[Other]) continue;
+					bool Same = true;
+					for (int32 Channel = 0; Channel < UVs.GetNumChannels(); ++Channel)
+						if (UVs.Get(VI, Channel) != UVs.Get(Other, Channel)) { Same = false; break; }
+					if (Same) { Match = Other; break; }
+				}
+				Remap[VI.GetValue()] = Match;
+				if (Match == VI) Unique.Add(VI); else Removed.Add(VI);
+			}
+		}
+		if (Removed.IsEmpty()) return 0;
+		for (FPolygonID P : MD.Polygons().GetElementIDs())
+		{
+			const auto Corners = MD.GetPolygonVertexInstances<TInlineAllocator<4>>(P);
+			for (int32 I = 0; I < Corners.Num(); ++I)
+				if (Remap[Corners[I].GetValue()] != Corners[I])
+					MD.SetPolygonVertexInstance(P, I, Remap[Corners[I].GetValue()]);
+		}
+		for (FVertexInstanceID VI : Removed) MD.DeleteVertexInstance(VI);
+		FElementIDRemappings IDs; MD.Compact(IDs);
+		return Removed.Num();
+	}
+
+	bool PrepareRuntimeRenderMesh(UStaticMesh* Mesh, FMeshDescription& MD, int32 Tris,
+		TArray<FMeshDescription>* ExtraLODs = nullptr)
+	{
+		// The editor fast builder initializes ray-tracing representations even
+		// when the project's renderer has ray tracing disabled. Preview meshes
+		// should not allocate an unused second geometry representation.
+		const IConsoleVariable* RayTracing = IConsoleManager::Get().FindConsoleVariable(TEXT("r.RayTracing"));
+		if (RayTracing && RayTracing->GetInt() == 0) Mesh->bSupportRayTracing = false;
 		SanitizeTangentBasis(MD);
+		GRenderCornersBefore += MD.VertexInstances().Num();
+		if (CVarCompactVertices.GetValueOnAnyThread()) CompactIdenticalCorners(MD);
+		GRenderCornersAfter += MD.VertexInstances().Num();
 		GPreparedTrisThisBuild += Tris;
 		UStaticMesh::FBuildMeshDescriptionsParams P;
 		P.bMarkPackageDirty = false;
@@ -2096,7 +2251,15 @@ namespace
 		LOD.bUseFullPrecisionUVs = true;
 		LOD.bUseHighPrecisionTangentBasis = true;
 		P.PerLODOverrides.Add(LOD);
-		const TArray<const FMeshDescription*> Descriptions{ &MD };
+		TArray<const FMeshDescription*> Descriptions{ &MD };
+		if (ExtraLODs)
+			for (FMeshDescription& Extra : *ExtraLODs)
+			{
+				SanitizeTangentBasis(Extra);
+				if (CVarCompactVertices.GetValueOnAnyThread()) CompactIdenticalCorners(Extra);
+				Descriptions.Add(&Extra);
+				P.PerLODOverrides.Add(LOD);
+			}
 		const bool bBuilt = Mesh->BuildFromMeshDescriptions(Descriptions, P);
 		// BuildFromMeshDescriptions creates a BodySetup even when collision was
 		// not requested. Registration otherwise asks that empty setup to cook the
@@ -2106,6 +2269,22 @@ namespace
 		if (UBodySetup* Body = Mesh->GetBodySetup())
 			Body->CollisionTraceFlag = CTF_UseSimpleAsComplex;
 		return bBuilt;
+	}
+
+	bool CompatibleLodMaterials(const TArray<BF6HP::FCore::FSection>& A, const TArray<BF6HP::FCore::FSection>& B)
+	{
+		if (A.Num() != B.Num()) return false;
+		for (int32 I = 0; I < A.Num(); ++I)
+		{
+			const auto& X = A[I]; const auto& Y = B[I];
+			if (X.bAlphaTest != Y.bAlphaTest || X.bTranslucent != Y.bTranslucent || X.bDecal != Y.bDecal ||
+				X.bNsm != Y.bNsm || X.bAlphaFromAlbedo != Y.bAlphaFromAlbedo ||
+				X.bTerrainDecalReceiver != Y.bTerrainDecalReceiver || X.BaseColor != Y.BaseColor ||
+				X.Roughness != Y.Roughness || X.Textures.Num() != Y.Textures.Num()) return false;
+			for (int32 J = 0; J < X.Textures.Num(); ++J)
+				if (X.Textures[J].Slot != Y.Textures[J].Slot || X.Textures[J].Texture != Y.Textures[J].Texture) return false;
+		}
+		return true;
 	}
 
 	// Build everything at once.
@@ -2121,6 +2300,17 @@ namespace
 		UStaticMesh::FBuildParameters BP;
 		BP.bInSilent = true;
 		UStaticMesh::BatchBuild(Meshes, BP);
+	}
+
+	// Conventional instancing chooses face culling per component, whereas
+	// Nanite can handle each instance's handedness. Put reflection on the
+	// component and give it positive-determinant local instances so both paths
+	// agree, including when a Nanite mesh falls back to conventional rendering.
+	FTransform HismLocalTransform(FMatrix LocalMatrix, bool bMirrored)
+	{
+		if (bMirrored)
+			for (int32 Row = 0; Row < 4; ++Row) LocalMatrix.M[Row][0] *= -1.0;
+		return FTransform(LocalMatrix);
 	}
 
 	// One decoded asset turned into a UStaticMesh.
@@ -2143,6 +2333,7 @@ namespace
 		TVertexAttributesRef<FVector3f>       VPos = Attr.GetVertexPositions();
 		TVertexInstanceAttributesRef<FVector3f> VNrm = Attr.GetVertexInstanceNormals();
 		TVertexInstanceAttributesRef<FVector2f> VUV  = Attr.GetVertexInstanceUVs();
+		TVertexInstanceAttributesRef<FVector4f> VCol = Attr.GetVertexInstanceColors();
 
 		// ONE POLYGON GROUP PER SECTION. A section is the unit the depot binds
 		// a material to, so merging them into one group throws that away: the
@@ -2185,6 +2376,9 @@ namespace
 						VNrm[VI] = FVector3f(N.X, N.Z, N.Y);
 					}
 					if (S.UV.IsValidIndex((int32)idx)) VUV.Set(VI, 0, S.UV[(int32)idx]);
+					// The source selector is nointerpolation. Use one palette entry
+					// per triangle, including where differently coloured parts meet.
+					VCol.Set(VI, 0, S.Colors.IsValidIndex((int32)a) ? S.Colors[(int32)a] : FVector4f(1, 1, 1, 1));
 					Corners.Add(VI);
 				}
 				MD.CreatePolygon(Group, Corners);
@@ -2202,6 +2396,23 @@ namespace
 	// runtime render path. For the runtime path the BodySetup is created HERE
 	// so that the render-data build can run on a worker afterwards -
 	// BuildFromMeshDescriptions would otherwise NewObject one from that thread.
+	float SectionUVDensity(const BF6HP::FCore::FSection& Section)
+	{
+		double Weighted = 0, Weight = 0;
+		for (int32 I = 0; I + 2 < Section.Idx.Num(); I += 3)
+		{
+			const int32 A = Section.Idx[I], B = Section.Idx[I+1], C = Section.Idx[I+2];
+			if (!Section.Pos.IsValidIndex(A) || !Section.Pos.IsValidIndex(B) || !Section.Pos.IsValidIndex(C) ||
+				!Section.UV.IsValidIndex(A) || !Section.UV.IsValidIndex(B) || !Section.UV.IsValidIndex(C)) continue;
+			const double Area = FVector3f::CrossProduct(Section.Pos[B]-Section.Pos[A], Section.Pos[C]-Section.Pos[A]).Size() * 10000.0;
+			const FVector2f U = Section.UV[B]-Section.UV[A], V = Section.UV[C]-Section.UV[A];
+			const double UVArea = FMath::Abs(double(U.X)*V.Y-double(U.Y)*V.X);
+			if (!FMath::IsFinite(Area) || !FMath::IsFinite(UVArea) || Area <= 1.e-12 || UVArea <= 1.e-12) continue;
+			Weighted += FMath::Sqrt(Area/UVArea)*Area; Weight += Area;
+		}
+		return Weight > 0 ? float(FMath::Min(Weighted/Weight, 1.e8)) : 0.f;
+	}
+
 	UStaticMesh* CreateMeshObject(UObject* Outer, const FString& Name, int32 Tris,
 	                              const TArray<BF6HP::FCore::FSection>& Sections,
 	                              bool& bOutNanite,
@@ -2223,6 +2434,9 @@ namespace
 			FStaticMaterial SM;
 			SM.MaterialSlotName  = FName(*FString::Printf(TEXT("S%d"), si));
 			SM.ImportedMaterialSlotName = SM.MaterialSlotName;
+			// Fast-built meshes otherwise have no UV-density metadata for texture
+			// streaming. Density is centimetres per UV unit, weighted by surface area.
+			SM.UVChannelData = FMeshUVChannelInfo(SectionUVDensity(Sections[si]));
 			SM.MaterialInterface = MaterialFor(
 				Mesh, Sections[si], RuntimeGlowColor, RuntimeGlowStrength,
 				(Glass && Glass->IsValidIndex(si)) ? &(*Glass)[si] : nullptr);
@@ -2553,8 +2767,7 @@ namespace
 			UMaterialEditingLibrary::ConnectMaterialProperty(Rg, TEXT(""), MP_Roughness);
 		}
 
-		M->PreEditChange(nullptr);
-		M->PostEditChange();
+		CompileNewMaterial(M);
 		// ROOTED, because this is a raw global pointing at a transient object.
 		// Every texture below is already rooted; the materials were not, so a
 		// garbage collection between two builds - a map load is enough - left
@@ -4017,8 +4230,7 @@ return lerp(saturate(GroundRoughness), saturate(1.0 - smoothness), mask);
 			UMaterialEditingLibrary::ConnectMaterialProperty(Rg, TEXT(""), MP_Roughness);
 		}
 
-		M->PreEditChange(nullptr);
-		M->PostEditChange();
+		CompileNewMaterial(M);
 		M->AddToRoot();   // see EnsureGroundMaterial: a raw global must be rooted
 		GGroundBlendParent = M;
 		return M;
@@ -4225,7 +4437,8 @@ return lerp(saturate(GroundRoughness), saturate(1.0 - smoothness), mask);
 	// written from scoped reads that bound nothing, so the meshes they hold are
 	// untextured and no recovery can fire behind a cache hit. They have to be
 	// read again once.
-	constexpr uint32 kCacheVerMesh = 4;
+	// 5: section vertex palette colours are preserved through the cache.
+	constexpr uint32 kCacheVerMesh = 5;
 
 	FString MeshCacheName(const FString& ResName, const FString& Bundle, const FString& Variation)
 	{
@@ -4252,15 +4465,17 @@ return lerp(saturate(GroundRoughness), saturate(1.0 - smoothness), mask);
 			TArray<FString>& Names = BindingNames[si];
 			int32 NPos = S.Pos.Num(), NNrm = S.Nrm.Num(), NUV = S.UV.Num();
 			int32 NIdx = S.Idx.Num(), NTex = S.Textures.Num();
+			int32 NCol = S.Colors.Num();
 			uint8 Flags = (S.bAlphaTest ? 1 : 0) | (S.bTranslucent ? 2 : 0)
 			            | (S.bAlphaFromAlbedo ? 4 : 0) | (S.bNsm ? 8 : 0)
 			            | (S.bDecal ? 16 : 0) | (S.bTerrainDecalReceiver ? 32 : 0);
 			Ar << NPos << NNrm << NUV << NIdx << NTex << Flags << S.BaseColor << S.Roughness;
+			Ar << NCol;
 			if (Ar.IsLoading())
 			{
-				const int64 Need = (int64)NPos * 12 + (int64)NNrm * 12 + (int64)NUV * 8 + (int64)NIdx * 4;
+				const int64 Need = (int64)NPos * 12 + (int64)NNrm * 12 + (int64)NUV * 8 + (int64)NIdx * 4 + (int64)NCol * 16;
 				if (Ar.IsError() || NPos < 0 || NNrm < 0 || NUV < 0 || NIdx < 0 ||
-				    NTex < 0 || NTex > 64 || Need > Ar.TotalSize() - Ar.Tell())
+				    (NCol != 0 && NCol != NPos) || NCol < 0 || NTex < 0 || NTex > 64 || Need > Ar.TotalSize() - Ar.Tell())
 				{
 					Ar.SetError();
 					return;
@@ -4275,6 +4490,7 @@ return lerp(saturate(GroundRoughness), saturate(1.0 - smoothness), mask);
 				S.Nrm.SetNumUninitialized(NNrm);
 				S.UV.SetNumUninitialized(NUV);
 				S.Idx.SetNumUninitialized(NIdx);
+				S.Colors.SetNumUninitialized(NCol);
 				S.Textures.SetNum(NTex);
 				Names.SetNum(NTex);
 			}
@@ -4282,14 +4498,216 @@ return lerp(saturate(GroundRoughness), saturate(1.0 - smoothness), mask);
 			Ar.Serialize(S.Nrm.GetData(), (int64)NNrm * sizeof(FVector3f));
 			Ar.Serialize(S.UV.GetData(), (int64)NUV * sizeof(FVector2f));
 			Ar.Serialize(S.Idx.GetData(), (int64)NIdx * sizeof(uint32));
+			Ar.Serialize(S.Colors.GetData(), (int64)NCol * sizeof(FVector4f));
 			for (int32 b = 0; b < NTex && !Ar.IsError(); b++)
 				Ar << S.Textures[b].Slot << Names[b];
 		}
 	}
 
+#if WITH_DEV_AUTOMATION_TESTS
+	IMPLEMENT_SIMPLE_AUTOMATION_TEST(FMaterialCacheOuterTest, "BF6.HighPoly.MaterialCacheDoesNotRetainOwner",
+		EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+	bool FMaterialCacheOuterTest::RunTest(const FString&)
+	{
+		TStrongObjectPtr<UStaticMesh> Owner(NewObject<UStaticMesh>(GetTransientPackage()));
+		TWeakObjectPtr<UObject> WeakOwner(Owner.Get());
+		BF6HP::FCore::FSection Section;
+		Section.BaseColor = FLinearColor(.314159f, .271828f, .161803f);
+		Section.Roughness = .1234567f;
+		UMaterialInstanceDynamic* Material = MaterialFor(Owner.Get(), Section);
+		if (!TestNotNull(TEXT("Real cache path creates a material"), Material)) return false;
+		TWeakObjectPtr<UMaterialInstanceDynamic> WeakMaterial(Material);
+		Owner.Reset();
+		CollectGarbage(RF_NoFlags);
+		TestFalse(TEXT("Cached material releases its original owner"), WeakOwner.IsValid());
+		TestTrue(TEXT("Cached material survives collection"), WeakMaterial.IsValid());
+		TestTrue(TEXT("Shared material belongs to the transient package"), Material->GetOuter() == GetTransientPackage());
+		for (auto It = GMaterialCache.CreateIterator(); It; ++It)
+			if (It.Value().Get() == Material) { It.RemoveCurrent(); break; }
+		return true;
+	}
+
+	IMPLEMENT_SIMPLE_AUTOMATION_TEST(FMaterialCacheLifetimeTest, "BF6.HighPoly.MaterialCacheLifetime",
+		EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+	bool FMaterialCacheLifetimeTest::RunTest(const FString&)
+	{
+		uint64 TextureKey = MAX_uint64;
+		while (GTextureCache.Contains(TextureKey)) --TextureKey;
+		int32 LutKey = MAX_int32;
+		while (GColorLutCache.Contains(LutKey)) --LutKey;
+		const FString MaterialKey = TEXT("lifetime-test-") + FGuid::NewGuid().ToString();
+		UTexture2D* Texture = UTexture2D::CreateTransient(1, 1);
+		UTexture2D* Lut = UTexture2D::CreateTransient(1, 1);
+		UMaterialInstanceDynamic* Material = UMaterialInstanceDynamic::Create(UMaterial::GetDefaultMaterial(MD_Surface), GetTransientPackage());
+		if (!Texture || !Lut || !Material) return false;
+		TWeakObjectPtr<UTexture2D> WeakTexture(Texture), WeakLut(Lut);
+		TWeakObjectPtr<UMaterialInstanceDynamic> WeakMaterial(Material);
+		GTextureCache.Add(TextureKey, TStrongObjectPtr<UTexture2D>(Texture));
+		GColorLutCache.Add(LutKey, TStrongObjectPtr<UTexture2D>(Lut));
+		GMaterialCache.Add(MaterialKey, TStrongObjectPtr<UMaterialInstanceDynamic>(Material));
+		// No actor/component owns these resources. This reproduces the interval
+		// between map rebuilds in which a raw-pointer cache loses its objects.
+		CollectGarbage(RF_NoFlags);
+		TestTrue(TEXT("Cached texture survives collection"), WeakTexture.IsValid());
+		TestTrue(TEXT("Cached LUT survives collection"), WeakLut.IsValid());
+		TestTrue(TEXT("Cached material survives collection"), WeakMaterial.IsValid());
+		GTextureCache.Remove(TextureKey);
+		GColorLutCache.Remove(LutKey);
+		GMaterialCache.Remove(MaterialKey);
+		CollectGarbage(RF_NoFlags);
+		TestFalse(TEXT("Released texture can be collected"), WeakTexture.IsValid());
+		TestFalse(TEXT("Released LUT can be collected"), WeakLut.IsValid());
+		TestFalse(TEXT("Released material can be collected"), WeakMaterial.IsValid());
+		return true;
+	}
+
+	IMPLEMENT_SIMPLE_AUTOMATION_TEST(FPaletteCacheTest, "BF6.HighPoly.PaletteCache",
+		EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+	bool FPaletteCacheTest::RunTest(const FString&)
+	{
+		TArray<BF6HP::FCore::FSection> Source;
+		auto& Section = Source.AddDefaulted_GetRef();
+		Section.Pos = {FVector3f(0, 0, 0), FVector3f(1, 0, 0), FVector3f(0, 1, 0)};
+		Section.Idx = {0, 1, 2};
+		Section.Colors = {FVector4f(.2f, .3f, .4f, 1), FVector4f(.8f, .7f, .6f, 1), FVector4f(1, 1, 1, 1)};
+		Section.BaseColor = FLinearColor(2, 2, 2, 1);
+		TArray<TArray<FString>> Names;
+		Names.SetNum(1);
+		TArray<uint8> Blob;
+		FMemoryWriter Writer(Blob);
+		SerialiseMeshSections(Writer, Source, Names);
+		TestFalse(TEXT("Palette cache writes successfully"), Writer.IsError());
+		TArray<BF6HP::FCore::FSection> Restored;
+		TArray<TArray<FString>> RestoredNames;
+		FMemoryReader Reader(Blob);
+		SerialiseMeshSections(Reader, Restored, RestoredNames);
+		if (!TestFalse(TEXT("Palette cache reads successfully"), Reader.IsError()) || Restored.Num() != 1) return false;
+		TestTrue(TEXT("Linear palette values survive the cache"), Restored[0].Colors == Section.Colors);
+		TestTrue(TEXT("Palette scale survives the cache"), Restored[0].BaseColor == Section.BaseColor);
+		FMeshDescription Description;
+		int32 Triangles = 0;
+		if (TestTrue(TEXT("Cached palette builds mesh geometry"), DescribeMesh(Restored, Description, Triangles)))
+		{
+			FStaticMeshAttributes Attributes(Description);
+			const auto Colours = Attributes.GetVertexInstanceColors();
+			for (const FVertexInstanceID Id : Description.VertexInstances().GetElementIDs())
+				TestTrue(TEXT("A triangle uses its source flat palette selector"), Colours[Id] == Section.Colors[0]);
+		}
+		// A truncated palette must be rejected before allocating/copying vertex arrays.
+		Blob.SetNum(Blob.Num() - 1);
+		FMemoryReader Truncated(Blob);
+		SerialiseMeshSections(Truncated, Restored, RestoredNames);
+		TestTrue(TEXT("Truncated palette cache is rejected"), Truncated.IsError());
+		return true;
+	}
+#endif
+
 	// Game thread: the core's name for every bound texture. False when the
 	// core cannot name one (an older dll) - then nothing is written, because a
 	// blob with an unnamed binding could only be resolved by an id that lies.
+#if WITH_DEV_AUTOMATION_TESTS
+	IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBF6MirroredPlacementTest, "BF6.HighPoly.Placement.MirroredInstances",
+		EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+	bool FBF6MirroredPlacementTest::RunTest(const FString&)
+	{
+		// Exercise all scale-sign combinations, nonuniform scale and rotated
+		// placements near and far from the world origin. Mesh-local normals and
+		// corners must see the same final transform, with one cull sign per batch.
+		for (int32 Mask = 0; Mask < 8; ++Mask)
+		for (const FVector Anchor : {FVector::ZeroVector, FVector(9800000, -6700000, 1000000)})
+		{
+			const FVector Scale((Mask & 1) ? -2.0 : 2.0, (Mask & 2) ? -3.0 : 3.0, (Mask & 4) ? -0.5 : 0.5);
+			const FTransform Original(FRotator(23, 117, -41), FVector(17321, -28763, 541), Scale);
+			const bool bMirrored = Original.ToMatrixWithScale().Determinant() < 0;
+			const FTransform Component(FQuat::Identity, Anchor, FVector(bMirrored ? -1 : 1, 1, 1));
+			const FTransform Local = HismLocalTransform(Original.ToMatrixWithScale(), bMirrored);
+			TestTrue(TEXT("Local instances have positive handedness"), Local.ToMatrixWithScale().Determinant() > 0);
+			TestEqual(TEXT("Component carries the authored cull sign"), Component.ToMatrixWithScale().Determinant() < 0, bMirrored);
+			for (const FVector Point : {FVector::ZeroVector, FVector(100, -70, 41), FVector(-913, 286, 7)})
+				TestTrue(TEXT("World corners retain their authored position"),
+					Component.TransformPosition(Local.TransformPosition(Point)).Equals(Original.TransformPosition(Point) + Anchor, 0.001));
+			TestTrue(TEXT("World tangent basis is preserved"),
+				Component.TransformVector(Local.TransformVector(FVector(0.3, -0.4, 0.5))).Equals(
+					Original.TransformVector(FVector(0.3, -0.4, 0.5)), 0.000001));
+		}
+		return true;
+	}
+
+	IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBF6StreamingGeometryTest, "BF6.HighPoly.Streaming.GeometryMetadata",
+		EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+	bool FBF6StreamingGeometryTest::RunTest(const FString&)
+	{
+		BF6HP::FCore::FSection Section;
+		Section.Pos = {FVector3f(0,0,0), FVector3f(1,0,0), FVector3f(0,1,0)};
+		Section.UV = {FVector2f(0,0), FVector2f(1,0), FVector2f(0,1)};
+		Section.Idx = {0,1,2};
+		TestEqual(TEXT("Game metres become centimetres per UV unit"), SectionUVDensity(Section), 100.f);
+		for (auto& P : Section.Pos) P *= 2;
+		TestEqual(TEXT("Larger geometry requests more texture detail"), SectionUVDensity(Section), 200.f);
+		for (auto& UV : Section.UV) UV *= 2;
+		TestEqual(TEXT("Repeated UVs compensate for geometry scale"), SectionUVDensity(Section), 100.f);
+		TArray<BF6HP::FCore::FSection> Base{Section}, Lower{Section};
+		TestTrue(TEXT("Matching LOD materials accepted"), CompatibleLodMaterials(Base, Lower));
+		Lower[0].BaseColor = FLinearColor::Red;
+		TestFalse(TEXT("A changed LOD tint cannot inherit the old material"), CompatibleLodMaterials(Base, Lower));
+		Lower[0] = Section; Lower[0].bTranslucent = true;
+		TestFalse(TEXT("A changed LOD shader cannot inherit the old material"), CompatibleLodMaterials(Base, Lower));
+		Section.UV = {FVector2f(0,0), FVector2f(0,0), FVector2f(0,0)};
+		TestEqual(TEXT("Collapsed UVs never request infinite detail"), SectionUVDensity(Section), 0.f);
+		BF6HP::FCore Other;
+		TestFalse(TEXT("Independent reader texture ids cannot collide"), FTextureCacheKey(42) == FTextureCacheKey(42, &Other));
+		return true;
+	}
+	IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBF6CompactCornersTest, "BF6.HighPoly.Streaming.CompactCorners",
+		EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+	bool FBF6CompactCornersTest::RunTest(const FString&)
+	{
+		auto Snapshot = [](FMeshDescription& MD)
+		{
+			TArray<float> Data; FStaticMeshAttributes A(MD);
+			for (FTriangleID T : MD.Triangles().GetElementIDs())
+			{
+				Data.Add(float(MD.GetTrianglePolygonGroup(T).GetValue()));
+				for (FVertexInstanceID VI : MD.GetTriangleVertexInstances(T))
+				{
+					for (FVector3f V : {A.GetVertexPositions()[MD.GetVertexInstanceVertex(VI)],
+						A.GetVertexInstanceNormals()[VI], A.GetVertexInstanceTangents()[VI]})
+					{ Data.Add(V.X); Data.Add(V.Y); Data.Add(V.Z); }
+					Data.Add(A.GetVertexInstanceBinormalSigns()[VI]);
+					const auto Color = A.GetVertexInstanceColors()[VI];
+					Data.Add(Color.X); Data.Add(Color.Y); Data.Add(Color.Z); Data.Add(Color.W);
+					auto UVs = A.GetVertexInstanceUVs();
+					for (int32 I = 0; I < UVs.GetNumChannels(); ++I)
+					{ const auto UV = UVs.Get(VI, I); Data.Add(UV.X); Data.Add(UV.Y); }
+				}
+			}
+			return Data;
+		};
+		for (int32 Seam = 0; Seam < 6; ++Seam)
+		{
+			BF6HP::FCore::FSection S;
+			S.Pos = {FVector3f(0,0,0),FVector3f(1,0,0),FVector3f(1,1,0),FVector3f(0,1,0)};
+			S.Nrm.Init(FVector3f(0,0,1), 4);
+			S.UV = {FVector2f(0,0),FVector2f(1,0),FVector2f(1,1),FVector2f(0,1)};
+			S.Idx = {0,1,2,0,2,3};
+			FMeshDescription MD; int32 Tris = 0; DescribeMesh({S}, MD, Tris);
+			FStaticMeshAttributes A(MD);
+			const FVertexInstanceID VI = MD.GetVertexVertexInstanceIDs(FVertexID(0)).Last();
+			if (Seam == 1) A.GetVertexInstanceUVs().Set(VI, 0, FVector2f(.25f, .5f));
+			if (Seam == 2) A.GetVertexInstanceColors()[VI] = FVector4f(1,0,0,1);
+			if (Seam == 3) A.GetVertexInstanceNormals()[VI] = FVector3f(1,0,0);
+			if (Seam == 4) A.GetVertexInstanceBinormalSigns()[VI] *= -1.f;
+			if (Seam == 5) { A.GetVertexInstanceUVs().SetNumChannels(2); A.GetVertexInstanceUVs().Set(VI, 1, FVector2f(1,1)); }
+			SanitizeTangentBasis(MD);
+			const auto Before = Snapshot(MD);
+			TestEqual(TEXT("Only identical corners are removed"), CompactIdenticalCorners(MD), Seam ? 1 : 2);
+			TestTrue(TEXT("Every triangle keeps its exact material, winding and corner attributes"), Snapshot(MD) == Before);
+			TestEqual(TEXT("Compaction is idempotent"), CompactIdenticalCorners(MD), 0);
+		}
+		return true;
+	}
+#endif
+
 	bool NameMeshBindings(const TArray<BF6HP::FCore::FSection>& Sections,
 	                      TArray<TArray<FString>>& OutNames)
 	{
@@ -4843,175 +5261,185 @@ return lerp(saturate(GroundRoughness), saturate(1.0 - smoothness), mask);
 		TileVertices.SetNumZeroed(TileCount);
 		TArray<int64> TileTriangles;
 		TileTriangles.SetNumZeroed(TileCount);
-		const double TerrainDescribeStart = FPlatformTime::Seconds();
-		ParallelFor(TileCount, [&](int32 TileIndex)
+		int32 Built = 0;
+		double TerrainDescribeS = 0.0, TerrainCommitS = 0.0;
+		const int32 BatchSize = FMath::Clamp(CVarTerrainBatch.GetValueOnGameThread(), 4, 256);
+		// Retaining all tile descriptions at once costs several GiB on a large
+		// heightfield. Complete and release each bounded group before the next.
+		for (int32 BatchStart = 0; BatchStart < TileCount; BatchStart += BatchSize)
 		{
-			const int32 tx = TileIndex % Tiles;
-			const int32 tz = TileIndex / Tiles;
-			const int32 x0 = tx * Per, x1 = FMath::Min(x0 + Per, N - 1);
-			const int32 z0 = tz * Per, z1 = FMath::Min(z0 + Per, N - 1);
-			if (x1 <= x0 || z1 <= z0) return;
-
-			FMeshDescription& MD = TileDescriptions[TileIndex];
-			FStaticMeshAttributes Attr(MD);
-			Attr.Register();
-			TVertexAttributesRef<FVector3f>         VPos = Attr.GetVertexPositions();
-			TVertexInstanceAttributesRef<FVector2f> VUV  = Attr.GetVertexInstanceUVs();
-			const FPolygonGroupID Group = MD.CreatePolygonGroup();
-			Attr.GetPolygonGroupMaterialSlotNames()[Group] = TEXT("BF6Terrain");
-
-			TMap<uint64, FVertexID> VertexByNative;
-			MD.ReserveNewVertices((x1 - x0 + 1) * (z1 - z0 + 1));
-			auto GetVertex = [&](int32 sx, int32 sz)
+			const int32 BatchEnd = FMath::Min(BatchStart + BatchSize, TileCount);
+			const double TerrainDescribeStart = FPlatformTime::Seconds();
+			ParallelFor(BatchEnd - BatchStart, [&](int32 BatchIndex)
 			{
-				const uint64 Key = (uint64)(uint32)sx | ((uint64)(uint32)sz << 32);
-				if (const FVertexID* Existing = VertexByNative.Find(Key)) return *Existing;
-				const FVertexID Id = MD.CreateVertex();
-				VPos[Id] = VertexAt(sx, sz);
-				VertexByNative.Add(Key, Id);
-				return Id;
-			};
-			auto SubdivAt = [&](int32 bx, int32 bz)
-			{
-				if (bx < 0 || bz < 0 || bx >= BaseCells || bz >= BaseCells) return 1;
-				return 1 << CellLevels[bz * BaseCells + bx];
-			};
-			auto Corner = [&](int32 sx, int32 sz)
-			{
-				const FVertexInstanceID Vi = MD.CreateVertexInstance(GetVertex(sx, sz));
-				VUV.Set(Vi, 0, FVector2f(
-					(float)sx / (T.Size - 1), (float)sz / (T.Size - 1)));
-				return Vi;
-			};
+				const int32 TileIndex = BatchStart + BatchIndex;
+				const int32 tx = TileIndex % Tiles;
+				const int32 tz = TileIndex / Tiles;
+				const int32 x0 = tx * Per, x1 = FMath::Min(x0 + Per, N - 1);
+				const int32 z0 = tz * Per, z1 = FMath::Min(z0 + Per, N - 1);
+				if (x1 <= x0 || z1 <= z0) return;
 
-			for (int32 bz = z0; bz < z1; bz++)
-				for (int32 bx = x0; bx < x1; bx++)
+				FMeshDescription& MD = TileDescriptions[TileIndex];
+				FStaticMeshAttributes Attr(MD);
+				Attr.Register();
+				TVertexAttributesRef<FVector3f>         VPos = Attr.GetVertexPositions();
+				TVertexInstanceAttributesRef<FVector2f> VUV  = Attr.GetVertexInstanceUVs();
+				const FPolygonGroupID Group = MD.CreatePolygonGroup();
+				Attr.GetPolygonGroupMaterialSlotNames()[Group] = TEXT("BF6Terrain");
+
+				TMap<uint64, FVertexID> VertexByNative;
+				MD.ReserveNewVertices((x1 - x0 + 1) * (z1 - z0 + 1));
+				auto GetVertex = [&](int32 sx, int32 sz)
 				{
-					const int32 Subdiv = SubdivAt(bx, bz);
-					const int32 CellStep = Step / Subdiv;
-					const int32 LeftSubdiv   = FMath::Max(Subdiv, SubdivAt(bx - 1, bz));
-					const int32 RightSubdiv  = FMath::Max(Subdiv, SubdivAt(bx + 1, bz));
-					const int32 TopSubdiv    = FMath::Max(Subdiv, SubdivAt(bx, bz - 1));
-					const int32 BottomSubdiv = FMath::Max(Subdiv, SubdivAt(bx, bz + 1));
-					const int32 NativeX = bx * Step, NativeZ = bz * Step;
+					const uint64 Key = (uint64)(uint32)sx | ((uint64)(uint32)sz << 32);
+					if (const FVertexID* Existing = VertexByNative.Find(Key)) return *Existing;
+					const FVertexID Id = MD.CreateVertex();
+					VPos[Id] = VertexAt(sx, sz);
+					VertexByNative.Add(Key, Id);
+					return Id;
+				};
+				auto SubdivAt = [&](int32 bx, int32 bz)
+				{
+					if (bx < 0 || bz < 0 || bx >= BaseCells || bz >= BaseCells) return 1;
+					return 1 << CellLevels[bz * BaseCells + bx];
+				};
+				auto Corner = [&](int32 sx, int32 sz)
+				{
+					const FVertexInstanceID Vi = MD.CreateVertexInstance(GetVertex(sx, sz));
+					VUV.Set(Vi, 0, FVector2f(
+						(float)sx / (T.Size - 1), (float)sz / (T.Size - 1)));
+					return Vi;
+				};
 
-					for (int32 lz = 0; lz < Step; lz += CellStep)
-						for (int32 lx = 0; lx < Step; lx += CellStep)
-						{
-							const int32 lx1 = lx + CellStep, lz1 = lz + CellStep;
-							TArray<FIntPoint, TInlineAllocator<36>> Ring;
-							Ring.Add(FIntPoint(lx, lz));
-							if (lx == 0)
-								for (int32 q = lz + Step / LeftSubdiv; q < lz1; q += Step / LeftSubdiv)
-									Ring.Add(FIntPoint(lx, q));
-							Ring.Add(FIntPoint(lx, lz1));
-							if (lz1 == Step)
-								for (int32 q = lx + Step / BottomSubdiv; q < lx1; q += Step / BottomSubdiv)
-									Ring.Add(FIntPoint(q, lz1));
-							Ring.Add(FIntPoint(lx1, lz1));
-							if (lx1 == Step)
-								for (int32 q = lz1 - Step / RightSubdiv; q > lz; q -= Step / RightSubdiv)
-									Ring.Add(FIntPoint(lx1, q));
-							Ring.Add(FIntPoint(lx1, lz));
-							if (lz == 0)
-								for (int32 q = lx1 - Step / TopSubdiv; q > lx; q -= Step / TopSubdiv)
-									Ring.Add(FIntPoint(q, lz));
+				for (int32 bz = z0; bz < z1; bz++)
+					for (int32 bx = x0; bx < x1; bx++)
+					{
+						const int32 Subdiv = SubdivAt(bx, bz);
+						const int32 CellStep = Step / Subdiv;
+						const int32 LeftSubdiv   = FMath::Max(Subdiv, SubdivAt(bx - 1, bz));
+						const int32 RightSubdiv  = FMath::Max(Subdiv, SubdivAt(bx + 1, bz));
+						const int32 TopSubdiv    = FMath::Max(Subdiv, SubdivAt(bx, bz - 1));
+						const int32 BottomSubdiv = FMath::Max(Subdiv, SubdivAt(bx, bz + 1));
+						const int32 NativeX = bx * Step, NativeZ = bz * Step;
 
-							// Fan the projected-convex ring. Added edge points are the
-							// exact points requested by the finer neighbour, so unlike a
-							// T-junction both sides describe the same 3-D boundary.
-							for (int32 i = 1; i + 1 < Ring.Num(); i++)
+						for (int32 lz = 0; lz < Step; lz += CellStep)
+							for (int32 lx = 0; lx < Step; lx += CellStep)
 							{
-								const FIntPoint& P0 = Ring[0];
-								const FIntPoint& P1 = Ring[i];
-								const FIntPoint& P2 = Ring[i + 1];
-								MD.CreatePolygon(Group, TArray<FVertexInstanceID>{
-									Corner(NativeX + P0.X, NativeZ + P0.Y),
-									Corner(NativeX + P1.X, NativeZ + P1.Y),
-									Corner(NativeX + P2.X, NativeZ + P2.Y) });
+								const int32 lx1 = lx + CellStep, lz1 = lz + CellStep;
+								TArray<FIntPoint, TInlineAllocator<36>> Ring;
+								Ring.Add(FIntPoint(lx, lz));
+								if (lx == 0)
+									for (int32 q = lz + Step / LeftSubdiv; q < lz1; q += Step / LeftSubdiv)
+										Ring.Add(FIntPoint(lx, q));
+								Ring.Add(FIntPoint(lx, lz1));
+								if (lz1 == Step)
+									for (int32 q = lx + Step / BottomSubdiv; q < lx1; q += Step / BottomSubdiv)
+										Ring.Add(FIntPoint(q, lz1));
+								Ring.Add(FIntPoint(lx1, lz1));
+								if (lx1 == Step)
+									for (int32 q = lz1 - Step / RightSubdiv; q > lz; q -= Step / RightSubdiv)
+										Ring.Add(FIntPoint(lx1, q));
+								Ring.Add(FIntPoint(lx1, lz));
+								if (lz == 0)
+									for (int32 q = lx1 - Step / TopSubdiv; q > lx; q -= Step / TopSubdiv)
+										Ring.Add(FIntPoint(q, lz));
+
+								// Fan the projected-convex ring. Added edge points are the
+								// exact points requested by the finer neighbour, so unlike a
+								// T-junction both sides describe the same 3-D boundary.
+								for (int32 i = 1; i + 1 < Ring.Num(); i++)
+								{
+									const FIntPoint& P0 = Ring[0];
+									const FIntPoint& P1 = Ring[i];
+									const FIntPoint& P2 = Ring[i + 1];
+									MD.CreatePolygon(Group, TArray<FVertexInstanceID>{
+										Corner(NativeX + P0.X, NativeZ + P0.Y),
+										Corner(NativeX + P1.X, NativeZ + P1.Y),
+										Corner(NativeX + P2.X, NativeZ + P2.Y) });
+								}
 							}
-						}
+					}
+
+				FStaticMeshOperations::ComputeTriangleTangentsAndNormals(MD);
+				FStaticMeshOperations::ComputeTangentsAndNormals(MD, EComputeNTBsFlags::Normals);
+				TileVertices[TileIndex] = MD.Vertices().Num();
+				TileTriangles[TileIndex] = MD.Triangles().Num();
+				TileValid[TileIndex] = 1;
+			});
+			TerrainDescribeS += FPlatformTime::Seconds() - TerrainDescribeStart;
+			const double TerrainCommitStart = FPlatformTime::Seconds();
+			// THE COMMIT IN THREE PHASES, NOT ONE LOOP. The 256 tiles used to be
+			// created, built and registered one after another on the game thread,
+			// and the render-data build in the middle was 8.6 s of the 13.5 s
+			// warm terrain phase. Object creation and component registration must
+			// stay on the game thread; the render-data build (vertex/index buffers
+			// from the description) does not touch UObjects once a BodySetup
+			// exists, so it runs across cores. BodySetups are created up front for
+			// exactly that reason - BuildFromMeshDescriptions would otherwise
+			// NewObject one from a worker thread.
+			TArray<UStaticMesh*> TileMeshes;
+			TileMeshes.SetNumZeroed(TileCount);
+			for (int32 TileIndex = BatchStart; TileIndex < BatchEnd; TileIndex++)
+			{
+				if (!TileValid[TileIndex]) continue;
+				const int32 tx = TileIndex % Tiles;
+				const int32 tz = TileIndex / Tiles;
+				UStaticMesh* SM = NewObject<UStaticMesh>(
+					A, *FString::Printf(TEXT("Terrain_%d_%d"), tx, tz), RF_Transient);
+				// THE GROUND'S REAL MATERIALS. Baked once for the whole map and
+				// shared by every tile: the material addresses the bake by WORLD
+				// POSITION, so one instance serves the lot and no tile needs UVs
+				// of its own. Null leaves the tile unmaterialled, which is the
+				// flat grey this replaces.
+				FStaticMaterial GMat;
+				GMat.MaterialInterface = GroundMat;
+				SM->GetStaticMaterials().Add(GMat);
+				SM->CreateBodySetup();
+				TileMeshes[TileIndex] = SM;
+			}
+			TArray<uint8> TileBuiltOk;
+			TileBuiltOk.SetNumZeroed(TileCount);
+			ParallelFor(BatchEnd - BatchStart, [&](int32 BatchIndex)
+			{
+				const int32 TileIndex = BatchStart + BatchIndex;
+				UStaticMesh* SM = TileMeshes[TileIndex];
+				if (!SM) return;
+				TileBuiltOk[TileIndex] = PrepareRuntimeRenderMesh(
+					SM, TileDescriptions[TileIndex], (int32)TileTriangles[TileIndex]) ? 1 : 0;
+			});
+			for (int32 TileIndex = BatchStart; TileIndex < BatchEnd; TileIndex++)
+			{
+				TileDescriptions[TileIndex] = FMeshDescription();
+				UStaticMesh* SM = TileMeshes[TileIndex];
+				if (!SM) continue;
+				const int32 tx = TileIndex % Tiles;
+				const int32 tz = TileIndex / Tiles;
+				if (!TileBuiltOk[TileIndex])
+				{
+					UE_LOG(LogBF6HighPoly, Error,
+						TEXT("terrain tile %d,%d runtime render build failed"), tx, tz);
+					continue;
 				}
 
-			FStaticMeshOperations::ComputeTriangleTangentsAndNormals(MD);
-			FStaticMeshOperations::ComputeTangentsAndNormals(MD, EComputeNTBsFlags::Normals);
-			TileVertices[TileIndex] = MD.Vertices().Num();
-			TileTriangles[TileIndex] = MD.Triangles().Num();
-			TileValid[TileIndex] = 1;
-		});
-		const double TerrainDescribeS = FPlatformTime::Seconds() - TerrainDescribeStart;
-
-		int32 Built = 0;
-		const double TerrainCommitStart = FPlatformTime::Seconds();
-		// THE COMMIT IN THREE PHASES, NOT ONE LOOP. The 256 tiles used to be
-		// created, built and registered one after another on the game thread,
-		// and the render-data build in the middle was 8.6 s of the 13.5 s
-		// warm terrain phase. Object creation and component registration must
-		// stay on the game thread; the render-data build (vertex/index buffers
-		// from the description) does not touch UObjects once a BodySetup
-		// exists, so it runs across cores. BodySetups are created up front for
-		// exactly that reason - BuildFromMeshDescriptions would otherwise
-		// NewObject one from a worker thread.
-		TArray<UStaticMesh*> TileMeshes;
-		TileMeshes.SetNumZeroed(TileCount);
-		for (int32 TileIndex = 0; TileIndex < TileCount; TileIndex++)
-		{
-			if (!TileValid[TileIndex]) continue;
-			const int32 tx = TileIndex % Tiles;
-			const int32 tz = TileIndex / Tiles;
-			UStaticMesh* SM = NewObject<UStaticMesh>(
-				A, *FString::Printf(TEXT("Terrain_%d_%d"), tx, tz), RF_Transient);
-			// THE GROUND'S REAL MATERIALS. Baked once for the whole map and
-			// shared by every tile: the material addresses the bake by WORLD
-			// POSITION, so one instance serves the lot and no tile needs UVs
-			// of its own. Null leaves the tile unmaterialled, which is the
-			// flat grey this replaces.
-			FStaticMaterial GMat;
-			GMat.MaterialInterface = GroundMat;
-			SM->GetStaticMaterials().Add(GMat);
-			SM->CreateBodySetup();
-			TileMeshes[TileIndex] = SM;
-		}
-		TArray<uint8> TileBuiltOk;
-		TileBuiltOk.SetNumZeroed(TileCount);
-		ParallelFor(TileCount, [&](int32 TileIndex)
-		{
-			UStaticMesh* SM = TileMeshes[TileIndex];
-			if (!SM) return;
-			TileBuiltOk[TileIndex] = PrepareRuntimeRenderMesh(
-				SM, TileDescriptions[TileIndex], (int32)TileTriangles[TileIndex]) ? 1 : 0;
-		});
-		for (int32 TileIndex = 0; TileIndex < TileCount; TileIndex++)
-		{
-			UStaticMesh* SM = TileMeshes[TileIndex];
-			if (!SM) continue;
-			const int32 tx = TileIndex % Tiles;
-			const int32 tz = TileIndex / Tiles;
-			if (!TileBuiltOk[TileIndex])
-			{
-				UE_LOG(LogBF6HighPoly, Error,
-					TEXT("terrain tile %d,%d runtime render build failed"), tx, tz);
-				continue;
+				UStaticMeshComponent* C = NewObject<UStaticMeshComponent>(
+					A, *FString::Printf(TEXT("TerrainMesh_%d_%d"), tx, tz));
+				C->SetupAttachment(Root);
+				BF6HP::Shared::MakeUnselectable(C);
+				C->SetMobility(EComponentMobility::Static);
+				C->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+				C->SetStaticMesh(SM);
+				// The SDK's official map-image aid is a deferred decal. State this
+				// explicitly so it continues to drape over the replacement terrain
+				// even if an engine default or component template changes.
+				C->SetReceivesDecals(true);
+				C->RegisterComponent();
+				Built++;
 			}
-
-			UStaticMeshComponent* C = NewObject<UStaticMeshComponent>(
-				A, *FString::Printf(TEXT("TerrainMesh_%d_%d"), tx, tz));
-			C->SetupAttachment(Root);
-			BF6HP::Shared::MakeUnselectable(C);
-			C->SetMobility(EComponentMobility::Static);
-			C->SetCollisionEnabled(ECollisionEnabled::NoCollision);
-			C->SetStaticMesh(SM);
-			// The SDK's official map-image aid is a deferred decal. State this
-			// explicitly so it continues to drape over the replacement terrain
-			// even if an engine default or component template changes.
-			C->SetReceivesDecals(true);
-			C->RegisterComponent();
-			Built++;
+			TerrainCommitS += FPlatformTime::Seconds() - TerrainCommitStart;
 		}
-		const double TerrainCommitS = FPlatformTime::Seconds() - TerrainCommitStart;
 		UE_LOG(LogBF6HighPoly, Log,
-			TEXT("terrain prepare: analyse %.1fs, describe %.1fs parallel, commit %.1fs"),
-			TerrainAnalyseS, TerrainDescribeS, TerrainCommitS);
+			TEXT("terrain prepare: analyse %.1fs, describe %.1fs parallel, commit %.1fs (batch %d)"),
+			TerrainAnalyseS, TerrainDescribeS, TerrainCommitS, BatchSize);
 		GTerrainTilesBuilt = Built;
 		GTerrainVerticesBuilt = 0;
 		GTerrainTrianglesBuilt = 0;
@@ -6651,23 +7079,27 @@ return lerp(saturate(GroundRoughness), saturate(1.0 - smoothness), mask);
 					// sampleBias ... for cascades 0 and 1, and sampleLevel(..., 0) for the
 					// flow-blended cascades 2 and 3'. The doubly-logarithmic mip ramp in
 					// that finding belongs to the VERTEX shader and is not used here.
-					"float4 n0=Texture2DSample(N0,N0Sampler,cascadePm/max(C0.x,1e-4))*C0.z;\n"
-					"float4 n1=Texture2DSample(N1,N1Sampler,cascadePm/max(C1.x,1e-4))*C1.z;\n"
-					"float4 n2=Texture2DSampleLevel(N2,N2Sampler,cascadePm/max(C2.x,1e-4),0)*C2.z;\n"
-					"float4 n3=Texture2DSampleLevel(N3,N3Sampler,cascadePm/max(C3.x,1e-4),0)*C3.z;\n"
+					"float4 n0=Texture2DSample(N0,N0Sampler,cascadePm/max(C0.x,1e-4));\n"
+					"float4 n1=Texture2DSample(N1,N1Sampler,cascadePm/max(C1.x,1e-4));\n"
+					"float4 n2=Texture2DSampleLevel(N2,N2Sampler,cascadePm/max(C2.x,1e-4),0);\n"
+					"float4 n3=Texture2DSampleLevel(N3,N3Sampler,cascadePm/max(C3.x,1e-4),0);\n"
 					"float p0=OverlapParams.y*cascadePm.x+OverlapParams.x*cascadePm.y;\n"
 					"float p1=OverlapParams.y*cascadePm.y-OverlapParams.x*cascadePm.x;\n"
 					"p1-=OverlapShearY*p0; p0-=OverlapParams.z*p1;\n"
 					"float2 ouv=float2(OverlapParams2.x*p0,OverlapParams2.y*p1)/max(C0.x,1e-4);\n"
 					// Same rule: the rotated second tap of cascade 0 is a derivative
 					// sample too, so it must not frac() either.
-					"float4 on=Texture2DSample(N0,N0Sampler,ouv)*C0.z;\n"
-					"float2 x0=n0.yz*2-1,x1=n1.yz*2-1,x2=n2.yz*2-1,x3=n3.yz*2-1;\n"
+					"float4 on=Texture2DSample(N0,N0Sampler,ouv);\n"
+					// Gate SIGNED normals. Zeroing a packed normal before *2-1
+					// decodes it as (-1,-1), creating a huge slope in absent
+					// cascades. The detail-distance fade then makes a camera-centred
+					// reflection circle on two-cascade maps such as MP_Dumbo.
+					"float2 x0=(n0.yz*2-1)*C0.z,x1=(n1.yz*2-1)*C1.z,x2=(n2.yz*2-1)*C2.z,x3=(n3.yz*2-1)*C3.z;\n"
 					"float2 s0=x0*Amplitude*rsqrt(max(1-dot(x0,x0),1e-5));\n"
 					"float2 s1=x1*Amplitude*rsqrt(max(1-dot(x1,x1),1e-5));\n"
 					"float2 s2=x2*Amplitude*rsqrt(max(1-dot(x2,x2),1e-5));\n"
 					"float2 s3=x3*Amplitude*rsqrt(max(1-dot(x3,x3),1e-5));\n"
-					"float2 oxn=on.yz*2-1; float2 os=oxn*(Amplitude*OverlapHeight)*rsqrt(max(1-dot(oxn,oxn),1e-5));\n"
+					"float2 oxn=(on.yz*2-1)*C0.z; float2 os=oxn*(Amplitude*OverlapHeight)*rsqrt(max(1-dot(oxn,oxn),1e-5));\n"
 					"// Exact PS SSA 303..314: undo the two shears, then rotate back.\n"
 					"float oy=os.y-os.x*OverlapParams.z; float ox=os.x-oy*OverlapShearY;\n"
 					"float2 overlapSlope=float2(OverlapParams.y*ox-OverlapParams.x*oy,OverlapParams.x*ox+OverlapParams.y*oy);\n"
@@ -7147,11 +7579,8 @@ return lerp(saturate(GroundRoughness), saturate(1.0 - smoothness), mask);
 		// appears to "load the water shaders" even though it merely gives that
 		// late compile time to finish. Compile the actual full-build vertex factory
 		// with the parent graph from the start.
-		M->PreEditChange(nullptr);
-		M->PostEditChange();
-		// SetMaterialUsage compiles immediately; the graph and its texture
-		// references must be finalized before that permutation is requested.
-		M->SetMaterialUsage(MATUSAGE_InstancedStaticMeshes);
+		M->SetUsageByFlag(MATUSAGE_InstancedStaticMeshes, true);
+		CompileNewMaterial(M);
 		// A material that fails to compile renders as the ENGINE DEFAULT, which
 		// is a flat grey - indistinguishable from "the water data is wrong"
 		// unless somebody reads the log. Say it loudly, at Warning, with the
@@ -8400,8 +8829,7 @@ return sheet + fade * fade * (1.0 - sheet);
 				Project, TEXT(""), MP_EmissiveColor);
 		}
 
-		M->PreEditChange(nullptr);
-		M->PostEditChange();
+		CompileNewMaterial(M);
 		BF6_ReportMaterialState(TEXT("cloud-shadow"), M);
 		M->AddToRoot();
 		GCloudShadowParent = M;
@@ -8683,8 +9111,7 @@ return lerp(phaseA, phaseB, phaseBlend) * Scale;
 			UMaterialEditingLibrary::ConnectMaterialProperty(Dome, TEXT(""), MP_EmissiveColor);
 		}
 
-		M->PreEditChange(nullptr);
-		M->PostEditChange();
+		CompileNewMaterial(M);
 		BF6_ReportMaterialState(TEXT("sky"), M);
 		// GSkyParent is a native cache, not a UPROPERTY. A completed build has no
 		// actor referencing this parent directly (only its MID does), so GC between
@@ -9892,6 +10319,12 @@ return lerp(phaseA, phaseB, phaseBlend) * Scale;
 			// represent. The scale is the tile width in metres (see the tree's
 			// Emplace), which is exactly what is needed.
 			HISM->NumCustomDataFloats = 1;
+			// AddInstances normally launches a hierarchy build immediately. Writing
+			// tile widths afterwards invalidates that job, so UE discards the tree
+			// and builds it a second time on every camera update. Submit the complete
+			// transform/custom-data batch before requesting the one explicit build.
+			const bool AutoRebuildWaterTree = HISM->bAutoRebuildTreeOnInstanceChanges;
+			HISM->bAutoRebuildTreeOnInstanceChanges = false;
 			HISM->ClearInstances();
 			HISM->AddInstances(Leaves, false, true, false);
 			for (int32 InstanceIndex = 0; InstanceIndex < Leaves.Num(); ++InstanceIndex)
@@ -9899,6 +10332,7 @@ return lerp(phaseA, phaseB, phaseBlend) * Scale;
 				HISM->SetCustomDataValue(InstanceIndex, 0,
 					(float)Leaves[InstanceIndex].GetScale3D().X, false);
 			}
+			HISM->bAutoRebuildTreeOnInstanceChanges = AutoRebuildWaterTree;
 			HISM->BuildTreeIfOutdated(true, true);
 			HISM->MarkRenderStateDirty();
 			// Report SATURATION, not just overflow. The old condition logged only
@@ -11362,6 +11796,11 @@ return lerp(phaseA, phaseB, phaseBlend) * Scale;
 		const int32 RemovedActors = BF6Ext::ClearAddonActors(kAddonName);
 		if (RemovedActors > 0)
 		{
+			CollectGarbage(RF_NoFlags);
+			FlushRenderingCommands();
+		}
+		if (RemovedActors > 0)
+		{
 			// DestroyActor only marks the previous build for collection. Each map
 			// owns thousands of transient static meshes and texture-backed MIDs, so
 			// starting another full build before a purge retained tens of GB across
@@ -11702,12 +12141,14 @@ return lerp(phaseA, phaseB, phaseBlend) * Scale;
 		int32 MeshesFromCache = 0;
 		std::atomic<int64> MeshCacheBytesWritten{ 0 };
 		GNaniteCountThisBuild = GNoNaniteTranslucent = GRuntimeMeshCountThisBuild = 0;
+		GRenderCornersBefore = 0; GRenderCornersAfter = 0;
 		GPreparedTrisThisBuild = 0;
 		GNaniteTrisThisBuild = 0;
 		GTexUploaded = GTexHighQuality = GTexRefused = 0;
 		GMidsMade = GBindingsSeen = GBindingsBound = 0;
 		GMaterialCacheHits = GMaterialCacheMisses = 0;
 		GSecObjectMaterials = GSecObjectPrepare = 0.0;
+		GGameLodMeshes = GGameLodRejected = 0;
 		GSecTexDecode = GSecTexPrefetch = GSecTexUpload = GSecParentMaterials = 0.0;
 		GTexFromCache = 0;
 		GTexCacheBytesWritten = 0;
@@ -11961,7 +12402,9 @@ return lerp(phaseA, phaseB, phaseBlend) * Scale;
 		// IN BATCHES, because the alternative is holding every decoded mesh and
 		// every description for the whole map at once: on a big map that is a
 		// gigabyte of geometry alive simultaneously for no reason.
-		constexpr int32 kBatch = 256;
+		const int32 RequestedBatch = CVarBuildBatch.GetValueOnGameThread();
+		const int32 kBatch = RequestedBatch > 0 ? FMath::Clamp(RequestedBatch, 32, 256)
+			: (FPlatformMemory::GetConstants().TotalPhysical <= 20ull * 1024 * 1024 * 1024 ? 32 : 128);
 
 		PhaseStart = FPlatformTime::Seconds();
 		int32 Placed = 0, Built = 0;
@@ -12030,9 +12473,10 @@ return lerp(phaseA, phaseB, phaseBlend) * Scale;
 				// base. Ungated groups carry an empty variation and read
 				// exactly as before.
 				const FGroup& G = ByMesh[Order[i]];
-				if (const TArray<BF6HP::FCore::FSection>* Cached = ReceiverDecoded.Find(Order[i]))
+				if (TArray<BF6HP::FCore::FSection>* Cached = ReceiverDecoded.Find(Order[i]))
 				{
-					Sections = *Cached;
+					Sections = MoveTemp(*Cached);
+					ReceiverDecoded.Remove(Order[i]);
 				}
 				else if (BlobOk[k] && ResolveMeshBlobBindings(Blobs[k]))
 				{
@@ -12216,12 +12660,41 @@ return lerp(phaseA, phaseB, phaseBlend) * Scale;
 				BatchOrdinal[i] = Built++;
 			}
 			SecCreate += FPlatformTime::Seconds() - T;
+			// Authored conventional LODs are a separate A/B from Nanite. Keep LOD0
+			// intact and accept only ladders whose section materials match exactly.
+			// Glass/decal graphs carry additional per-section facts: leave them on
+			// their original representation until those facts have a complete LOD join.
+			TArray<TArray<FMeshDescription>> GameLods;
+			GameLods.SetNum(Decoded.Num());
+			if (CVarGameLODs.GetValueOnGameThread())
+			{
+				for (int32 I = 0; I < Decoded.Num(); ++I)
+				{
+					if (!BatchMeshes[I] || BatchNanite[I] || Tris[I] < 512) continue;
+					bool bSpecial = false;
+					for (const auto& S : Decoded[I]) bSpecial |= S.bTranslucent || S.bDecal || S.bTerrainDecalReceiver;
+					if (bSpecial) continue;
+					const FGroup& G = ByMesh[Names[I]];
+					int32 PreviousTris = Tris[I];
+					for (int32 L = 1; L <= 2; ++L)
+					{
+						TArray<BF6HP::FCore::FSection> Lower;
+						if (!GCore.ReadMesh(BF6HP::FCore::MeshResourceFor(G.Mesh), Lower, G.Bundle, G.Variation, nullptr, 0, L)) break;
+						if (!CompatibleLodMaterials(Decoded[I], Lower)) { ++GGameLodRejected; break; }
+						FMeshDescription Description; int32 LowerTris = 0;
+						if (!DescribeMesh(Lower, Description, LowerTris) || LowerTris <= 0 || LowerTris >= PreviousTris) break;
+						PreviousTris = LowerTris;
+						GameLods[I].Add(MoveTemp(Description));
+					}
+					if (GameLods[I].Num()) ++GGameLodMeshes;
+				}
+			}
 
 			T = FPlatformTime::Seconds();
 			ParallelFor(Decoded.Num(), [&](int32 i)
 			{
 				if (!BatchMeshes[i] || BatchNanite[i]) return;
-				BatchCommitted[i] = PrepareRuntimeRenderMesh(BatchMeshes[i], Descs[i], Tris[i]) ? 1 : 0;
+				BatchCommitted[i] = PrepareRuntimeRenderMesh(BatchMeshes[i], Descs[i], Tris[i], &GameLods[i]) ? 1 : 0;
 			});
 			const double BatchRuntimeS = FPlatformTime::Seconds() - T;
 			SecCommitRuntime += BatchRuntimeS;
@@ -12268,21 +12741,27 @@ return lerp(phaseA, phaseB, phaseBlend) * Scale;
 				// instance transform.  This preserves the authored double-precision
 				// world placement instead of clamping or deleting the far world.
 				constexpr double kHismCellCm = 1000000.0;
-				TMap<FIntVector, TArray<const BF6HP::FPlacement*>> Cells;
+				// W partitions handedness within each spatial cell. Sharing a
+				// conventional draw between mirrored and ordinary placements makes
+				// one set inside out (the Manhattan Bridge anchorage is one case).
+				TMap<FIntVector4, TArray<const BF6HP::FPlacement*>> Cells;
 				for (const BF6HP::FPlacement* p : ByMesh[Names[i]].Rows)
 				{
 					const FVector World = ToUnreal(p->Origin);
-					const FIntVector Cell(
+					const bool bMirrored = FVector::DotProduct(FVector(p->Right),
+						FVector::CrossProduct(FVector(p->Up), FVector(p->Forward))) < 0.0;
+					const FIntVector4 Cell(
 						FMath::RoundToInt(World.X / kHismCellCm),
 						FMath::RoundToInt(World.Y / kHismCellCm),
-						FMath::RoundToInt(World.Z / kHismCellCm));
+						FMath::RoundToInt(World.Z / kHismCellCm), bMirrored ? 1 : 0);
 					Cells.FindOrAdd(Cell).Add(p);
 				}
 				if (Cells.Num() > 1) SpatialHismSplits += Cells.Num() - 1;
 
 				int32 CellIndex = 0;
-				for (const TPair<FIntVector, TArray<const BF6HP::FPlacement*>>& CellRows : Cells)
+				for (const TPair<FIntVector4, TArray<const BF6HP::FPlacement*>>& CellRows : Cells)
 				{
+					const bool bMirrored = CellRows.Key.W != 0;
 					const FVector Anchor(
 						(double)CellRows.Key.X * kHismCellCm,
 						(double)CellRows.Key.Y * kHismCellCm,
@@ -12295,6 +12774,7 @@ return lerp(phaseA, phaseB, phaseBlend) * Scale;
 					H->SetStaticMesh(SM);
 					H->SetMobility(EComponentMobility::Static);
 					H->SetRelativeLocation(Anchor);
+					H->SetRelativeScale3D(FVector(bMirrored ? -1.0 : 1.0, 1.0, 1.0));
 					H->SetCollisionEnabled(ECollisionEnabled::NoCollision);
 					H->SetCanEverAffectNavigation(false);
 					// The virtual-shadow queue was overflowing on Aftermath. Every
@@ -12339,7 +12819,7 @@ return lerp(phaseA, phaseB, phaseBlend) * Scale;
 					const FVector Local = ToUnreal(p->Origin) - Anchor;
 					MaxInstanceLocalCm = FMath::Max(MaxInstanceLocalCm,
 						FMath::Max3(FMath::Abs(Local.X), FMath::Abs(Local.Y), FMath::Abs(Local.Z)));
-					Xf.Add(FTransform(FMatrix(X, Z, Y, Local)));
+					Xf.Add(HismLocalTransform(FMatrix(X, Z, Y, Local), bMirrored));
 					}
 					H->AddInstances(Xf, false);
 					Placed += Xf.Num();
@@ -12641,6 +13121,8 @@ return lerp(phaseA, phaseB, phaseBlend) * Scale;
 			BF6HP::DiskCache::FlushPendingWrites();
 			const double SecFlush = FPlatformTime::Seconds() - FlushStart;
 			const BF6HP::DiskCache::FStats CS = BF6HP::DiskCache::Stats();
+			UE_LOG(LogBF6HighPoly, Display, TEXT("performance: %d authored-LOD mesh(es), %d incompatible LOD material layouts retained at LOD0; %d optional cache writes skipped for memory budget"),
+				GGameLodMeshes, GGameLodRejected, CS.WritesSkipped);
 			UE_LOG(LogBF6HighPoly, Display,
 				TEXT("DERIVED CACHE: %d hit(s), %d miss(es), %d written; %.1f MB read in %.2fs, ")
 				TEXT("%.1f MB written; signature %s; packed %.1f MB raw, %.2fs writing on workers, %.2fs waited at the end"),
@@ -13108,6 +13590,7 @@ return lerp(phaseA, phaseB, phaseBlend) * Scale;
 
 	void StartRead()
 	{
+		GTestBuildCompleted = false;
 		if (BF6HP::Shared::CoreBusy())
 		{
 			UE_LOG(LogBF6HighPoly, Display,
@@ -13293,6 +13776,7 @@ return lerp(phaseA, phaseB, phaseBlend) * Scale;
 	// compiles.
 	void ResetPerMapState()
 	{
+		GTestBuildCompleted = false;
 		++GMapEpoch; // invalidates any background DXIL page from the old build
 		// Not unrooted: these were never rooted. They stay alive through the
 		// material instances that reference them, and those go with the
@@ -13372,6 +13856,7 @@ return lerp(phaseA, phaseB, phaseBlend) * Scale;
 	// that live components are still sampling.
 	void ClearBuiltScene()
 	{
+		GTestBuildCompleted = false;
 		// Clearing the scenery is asking for it NOT to be there. A build still
 		// waiting its turn would put it straight back.
 		CancelQueuedBuild(TEXT("the scenery was cleared"));
@@ -13495,6 +13980,7 @@ return lerp(phaseA, phaseB, phaseBlend) * Scale;
 		// its file happened to remain beside the plugin. The canonical core now
 		// owns the water-height path as well as every other live read.
 		const FString Dll = BF6HP::CoreDllPath();
+		BF6HP::Performance::Initialize();
 		// The derived cache keys on THIS install: every .toc and the exe.
 		BF6HP::DiskCache::Configure(Install, CacheDir());
 		{
@@ -13528,6 +14014,11 @@ return lerp(phaseA, phaseB, phaseBlend) * Scale;
 
 		// The first 100 units prepare base geometry. Reserve 20 for the work
 		// that used to start after the dialog disappeared at 100%.
+		// The SDK reuses its editor world. Destroyed actors from the previous
+		// map otherwise keep their large render resources until a later GC,
+		// overlapping two complete scenes throughout this synchronous build.
+		CollectGarbage(RF_NoFlags);
+		FlushRenderingCommands();
 		FScopedSlowTask Task(120.f, LOCTEXT("Reading", "High Poly"));
 		Task.MakeDialog(true);   // with a cancel button
 
@@ -13711,6 +14202,24 @@ return lerp(phaseA, phaseB, phaseBlend) * Scale;
 			if(!bCancelled)
 			{
 				Task.EnterProgressFrame(3.f,LOCTEXT("CompileScene","Finishing mesh and material compilation"));
+				{
+					// A quality change can create a new, incomplete shader map for a
+					// startup-warmed parent without queuing jobs (UE's on-demand path).
+					// Finalization must submit those jobs before it waits for compilation.
+					FMaterialUpdateContext Update(FMaterialUpdateContext::EOptions::SyncWithRenderingThread);
+					auto QueueParent = [&](UMaterial* Parent)
+					{
+						if (Parent && !Parent->IsComplete())
+						{
+							Update.AddMaterial(Parent);
+							Parent->ForceRecompileForRendering(EMaterialShaderPrecompileMode::Background);
+						}
+					};
+					for (UMaterial* Parent : GParents) QueueParent(Parent);
+					for (UMaterial* Parent : GEmissiveParents) QueueParent(Parent);
+					for (UMaterial* Parent : { GGroundParent, GGroundBlendParent, GWaterParent, GSkyParent, GCloudShadowParent })
+						QueueParent(Parent);
+				}
 				FAssetCompilingManager::Get().FinishAllCompilation();
 				Task.EnterProgressFrame(1.f,LOCTEXT("UploadScene","Finishing scene uploads"));
 				FlushRenderingCommands();
@@ -13718,6 +14227,7 @@ return lerp(phaseA, phaseB, phaseBlend) * Scale;
 			}
 		}
 		BuildS=FPlatformTime::Seconds()-T0;
+		GTestBuildCompleted = !bCancelled;
 		GStatus = FString::Printf(TEXT("%s%d of %d placements, %d mesh(es)%s, %.0fs%s"),
 			bCancelled ? TEXT("stopped, partial scene: ") : TEXT(""),
 			GLastCount, P.Num(), Meshes,
@@ -13961,6 +14471,15 @@ return lerp(phaseA, phaseB, phaseBlend) * Scale;
 				}
 			};
 			R.Add(MoveTemp(Mode));
+			FControl Quality;
+			Quality.Kind = FControl::EKind::Choice;
+			Quality.Label = TEXT("PERFORMANCE");
+			Quality.Tip = TEXT("Budget viewport lighting, shadows and effects. Geometry, material bindings and exports retain their detail. Current restores the editor quality from before the preset.");
+			Quality.Choices = { TEXT("Current editor quality"), TEXT("Performance"), TEXT("Balanced") };
+			Quality.GetChoice = []{ return BF6HP::Performance::GetProfile(); };
+			Quality.SetChoice = [](int32 I){ BF6HP::Performance::SetProfile(I); };
+			Quality.Sub = []{ return FString(TEXT("lighting, shadows and effects")); };
+			R.Add(MoveTemp(Quality));
 
 			// No LOW-POLY MAP switch: see HideLowPolyNow. The blockout goes
 			// when the build has replaced it and comes back from the scene
@@ -14892,6 +15411,55 @@ static FAutoConsoleCommand GHighPolyBuildCmd(
     // is the exact confusion the button was changed to avoid. Two ways to ask
     // for the same thing should not do different things.
     FConsoleCommandDelegate::CreateStatic([] { BuildAndShow(); }));
+
+// Read actual streaming registration and resident mip memory. NeverStream=false
+// alone does not establish that transient textures can evict/reload their mips.
+static FAutoConsoleCommand GHighPolyTestStateCmd(
+	TEXT("BF6.HighPoly.TestState"), TEXT("<output.json>: capture build and texture residency for local tests."),
+	FConsoleCommandWithArgsDelegate::CreateStatic([](const TArray<FString>& Args)
+	{
+		if (Args.Num() != 1) return;
+		const TSharedRef<FJsonObject> J = MakeShared<FJsonObject>();
+		J->SetBoolField(TEXT("building"), GBuildQueuedOrRunning.load());
+		J->SetBoolField(TEXT("completed"), GTestBuildCompleted);
+		J->SetBoolField(TEXT("builtAnything"), GBuiltAnything);
+		J->SetBoolField(TEXT("previewsBusy"), BF6HPPreviews::IsBusy());
+		J->SetBoolField(TEXT("coreBusy"), BF6HP::Shared::CoreBusy());
+		J->SetStringField(TEXT("status"), GStatus);
+		J->SetStringField(TEXT("placed"), BF6HP::Placed::StatusLine());
+		J->SetStringField(TEXT("resolving"), BF6HP::Placed::Resolving());
+		TArray<TSharedPtr<FJsonValue>> IncompleteParents;
+		auto CheckParent = [&](UMaterial* Parent)
+		{
+			if (Parent && !Parent->IsComplete())
+				IncompleteParents.Add(MakeShared<FJsonValueString>(Parent->GetName()));
+		};
+		for (UMaterial* Parent : GParents) CheckParent(Parent);
+		for (UMaterial* Parent : GEmissiveParents) CheckParent(Parent);
+		for (UMaterial* Parent : { GGroundParent, GGroundBlendParent, GWaterParent, GSkyParent, GCloudShadowParent })
+			CheckParent(Parent);
+		J->SetArrayField(TEXT("incompleteParentMaterials"), IncompleteParents);
+		int32 Streamable = 0, Textures = 0;
+		uint64 ResidentBytes = 0, ResidentMips = 0;
+		for (const auto& Pair : GTextureCache)
+			if (UTexture2D* T = Pair.Value.Get())
+			{
+				++Textures;
+				Streamable += T->IsStreamable() ? 1 : 0;
+				ResidentBytes += T->CalcTextureMemorySizeEnum(TMC_ResidentMips);
+				ResidentMips += T->GetNumResidentMips();
+			}
+		J->SetNumberField(TEXT("cachedTextures"), Textures);
+		J->SetNumberField(TEXT("streamableTextures"), Streamable);
+		J->SetNumberField(TEXT("renderCornersBefore"), double(GRenderCornersBefore.load()));
+		J->SetNumberField(TEXT("renderCornersAfter"), double(GRenderCornersAfter.load()));
+		J->SetNumberField(TEXT("residentTextureBytes"), static_cast<double>(ResidentBytes));
+		J->SetNumberField(TEXT("residentMips"), static_cast<double>(ResidentMips));
+		FString Text;
+		FJsonSerializer::Serialize(J, TJsonWriterFactory<>::Create(&Text));
+		if (!FFileHelper::SaveStringToFile(Text, *Args[0]))
+			UE_LOG(LogBF6HighPoly, Error, TEXT("Cannot write test state: %s"), *Args[0]);
+	}));
 
 // The detail ladder, from the console. It had no command at all: the only way
 // to change it was the panel's dropdown, which makes it unreachable from a
@@ -17187,6 +17755,7 @@ namespace Shared
 			FStaticMaterial SM;
 			SM.MaterialSlotName = FName(*FString::Printf(TEXT("S%d"), si));
 			SM.ImportedMaterialSlotName = SM.MaterialSlotName;
+			SM.UVChannelData = FMeshUVChannelInfo(SectionUVDensity(Sections[si]));
 			SM.MaterialInterface = MaterialFor(Mesh, Sections[si]);
 			Mesh->GetStaticMaterials().Add(SM);
 		}
@@ -17542,6 +18111,7 @@ void FBF6HighPolyModule::StartupModule()
 
 void FBF6HighPolyModule::ShutdownModule()
 {
+	BF6HP::Performance::StopCapture();
 	// ---- THE CORE'S WORKERS GO BEFORE ANYTHING ELSE ----
 	//
 	// GCore.Close at the bottom of this function frees a raw libbf6 context, and
@@ -17558,6 +18128,9 @@ void FBF6HighPolyModule::ShutdownModule()
 	BF6HP::Loadout::Stop();
 	BF6HPPreviews::JoinCoreWorkers();
 	BF6HP::Placed::JoinCoreWorkers();
+	GMaterialCache.Empty();
+	GColorLutCache.Empty();
+	GTextureCache.Empty();
 
 	// ---- BF6UiSound ---- first: a rooted wave and a playing preview both need the
 	// UObject system and bf6_core.dll still standing.

@@ -8,6 +8,13 @@
 #include "TextureResource.h"
 #include "RenderingThread.h"
 #include "RHICommandList.h"
+#include "Async/Async.h"
+#include "HAL/IConsoleManager.h"
+#include "ProfilingDebugging/CpuProfilerTrace.h"
+#if WITH_DEV_AUTOMATION_TESTS
+#include "Misc/AutomationTest.h"
+#include "Misc/ScopeExit.h"
+#endif
 
 #if PLATFORM_WINDOWS
 #include "ID3D12DynamicRHI.h"
@@ -21,8 +28,15 @@ DEFINE_LOG_CATEGORY_STATIC(LogBF6WaterFFT, Log, All);
 
 namespace BF6HP
 {
+struct FWaterFFT::FAsyncFrame
+{
+	TArray<FCascade> Cascades;
+	float Seconds = 0.f;
+};
 namespace
 {
+	TAutoConsoleVariable<int32> CVarWaterAsync(TEXT("BF6.HighPoly.WaterAsync"), 1,
+		TEXT("Compute ocean FFTs on one bounded worker job. 0 provides the synchronous comparison."));
 	FORCEINLINE int32 Wrap(int32 V, int32 N) { return V & (N - 1); }
 	FORCEINLINE FWaterFFT::FComplex Mul(const FWaterFFT::FComplex& A, float C, float S)
 	{
@@ -839,13 +853,22 @@ bool FWaterFFT::Initialize(FCore& Core, const TArray<FCore::FWaterCascade>& Inpu
 	{
 		// t=0 is deterministic and provides valid textures before the first
 		// editor ticker. The repeated run is the control used by the core test.
-		for (FCascade& C : Cascades) Evolve(C, 0.f);
+		for (FCascade& C : Cascades)
+		{
+			Evolve(C, 0.f, TimeSeconds);
+			Upload(C.Displacement, C.DisplacementPixels, C.N);
+			Upload(C.NormalFoam, C.NormalPixels, C.N);
+		}
 	}
 	return !Cascades.IsEmpty();
 }
 
 void FWaterFFT::Reset()
 {
+	// A job owns only copied numeric inputs, never UObjects or this instance.
+	// Join this one bounded calculation before module code can be unloaded.
+	if (PendingFrame.IsValid()) { PendingFrame.Wait(); PendingFrame = {}; }
+	PendingSeconds = 0.f;
 	if (Direct)
 	{
 		// Native D3D12 resources cannot be released merely because their last
@@ -986,8 +1009,9 @@ void FWaterFFT::Upload(UTexture2D* Texture, const TArray<FFloat16Color>& Pixels,
 	}
 }
 
-void FWaterFFT::Evolve(FCascade& C, float DeltaSeconds)
+void FWaterFFT::Evolve(FCascade& C, float DeltaSeconds, float SimulationTime)
 {
+	TRACE_CPUPROFILER_EVENT_SCOPE(BF6WaterCompute);
 	const int32 N = C.N;
 	const int32 Count = N * N;
 	const float Pi = 3.1415927410125732421875f;
@@ -1000,7 +1024,7 @@ void FWaterFFT::Evolve(FCascade& C, float DeltaSeconds)
 			const float Kx = ((float)(x + x) - N) * -Pi / C.TileM;
 			const float Ky = ((float)(y + y) - N) *  Pi / C.TileM;
 			const float K = FMath::Sqrt(Kx * Kx + Ky * Ky);
-			const float Phase = FMath::Sqrt(9.8f * K) * TimeSeconds;
+			const float Phase = FMath::Sqrt(9.8f * K) * SimulationTime;
 			const float Co = FMath::Cos(Phase), Si = FMath::Sin(Phase);
 			const FComplex A = Mul(C.H0[I], Co, Si);
 			const FComplex HM = { C.H0[Mirror].R, -C.H0[Mirror].I };
@@ -1055,7 +1079,8 @@ void FWaterFFT::Evolve(FCascade& C, float DeltaSeconds)
 			C.FoamWork[I] = FMath::Lerp(Instant, C.FoamPrevious[I], Lag);
 		}
 
-	TArray<FFloat16Color> DisplacementPixels, NormalPixels;
+	TArray<FFloat16Color>& DisplacementPixels = C.DisplacementPixels;
+	TArray<FFloat16Color>& NormalPixels = C.NormalPixels;
 	DisplacementPixels.SetNumUninitialized(Count);
 	NormalPixels.SetNumUninitialized(Count);
 	for (int32 y = 0; y < N; ++y)
@@ -1082,15 +1107,55 @@ void FWaterFFT::Evolve(FCascade& C, float DeltaSeconds)
 				Normal.X * 0.5f + 0.5f, Normal.Y * 0.5f + 0.5f, 1.f));
 		}
 	C.FoamPrevious = C.FoamWork;
-	Upload(C.Displacement, DisplacementPixels, N);
-	Upload(C.NormalFoam, NormalPixels, N);
 }
 
 void FWaterFFT::Tick(float DeltaSeconds)
 {
+	TRACE_CPUPROFILER_EVENT_SCOPE(BF6WaterTick);
 	if (Cascades.IsEmpty()) return;
-	TimeSeconds += FMath::Clamp(DeltaSeconds, 0.f, 0.1f);
-	for (FCascade& C : Cascades) Evolve(C, DeltaSeconds);
+	PendingSeconds += FMath::Clamp(DeltaSeconds, 0.f, 0.1f);
+	if (PendingFrame.IsValid())
+	{
+		if (!PendingFrame.IsReady()) return; // Keep displaying the last complete frame; never queue a backlog.
+		auto Frame = PendingFrame.Get(); PendingFrame = {};
+		check(Frame->Cascades.Num() == Cascades.Num());
+		for (int32 I = 0; I < Cascades.Num(); ++I)
+		{
+			UTexture2D* Displacement = Cascades[I].Displacement;
+			UTexture2D* Normal = Cascades[I].NormalFoam;
+			Cascades[I] = MoveTemp(Frame->Cascades[I]);
+			Cascades[I].Displacement = Displacement; Cascades[I].NormalFoam = Normal;
+			Upload(Displacement, Cascades[I].DisplacementPixels, Cascades[I].N);
+			Upload(Normal, Cascades[I].NormalPixels, Cascades[I].N);
+		}
+		TimeSeconds = Frame->Seconds; // Proofs and diagnostics describe the published textures.
+	}
+	if (PendingSeconds > 0.f)
+	{
+		const float Step = PendingSeconds; PendingSeconds = 0.f;
+		if (!Direct && CVarWaterAsync.GetValueOnGameThread() != 0)
+		{
+			TSharedPtr<FAsyncFrame, ESPMode::ThreadSafe> Frame = MakeShared<FAsyncFrame, ESPMode::ThreadSafe>();
+			Frame->Seconds = TimeSeconds + Step;
+			Frame->Cascades = Cascades;
+			for (FCascade& C : Frame->Cascades) { C.Displacement = nullptr; C.NormalFoam = nullptr; }
+			PendingFrame = Async(EAsyncExecution::ThreadPool, [Frame, Step]
+			{
+				for (FCascade& C : Frame->Cascades) Evolve(C, Step, Frame->Seconds);
+				return Frame;
+			});
+		}
+		else
+		{
+			TimeSeconds += Step;
+			for (FCascade& C : Cascades)
+			{
+				Evolve(C, Step, TimeSeconds);
+				Upload(C.Displacement, C.DisplacementPixels, C.N);
+				Upload(C.NormalFoam, C.NormalPixels, C.N);
+			}
+		}
+	}
 
 	// HEADLESS DIAGNOSTIC. The one number that separates "the sea is wrong" from
 	// "the sea is not moving": the height field's RMS straight out of the CPU
@@ -1266,6 +1331,56 @@ FString FWaterFFT::DisplacementSummary() const
 		Worst, Worst * 1000.f);
 	return Out;
 }
+
+#if WITH_DEV_AUTOMATION_TESTS
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FWaterAsyncTest, "BF6.HighPoly.Water.AsyncReplay",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FWaterAsyncTest::RunTest(const FString&)
+{
+	const int32 Previous = CVarWaterAsync.GetValueOnGameThread();
+	CVarWaterAsync->Set(1, ECVF_SetByCode);
+	ON_SCOPE_EXIT { CVarWaterAsync->Set(Previous, ECVF_SetByCode); };
+	for (bool Zero : { true, false })
+	{
+		FWaterFFT::FCascade Seed;
+		Seed.N = 16; Seed.TileM = 64.f; Seed.Choppiness = 1.f;
+		Seed.bFoam = true; Seed.FoamThreshold = -0.1f; Seed.FoamMax = 0.8f; Seed.FoamHalfLife = 2.f;
+		const int32 Count = Seed.N * Seed.N;
+		Seed.H0.SetNumZeroed(Count); Seed.Height.SetNumZeroed(Count);
+		Seed.DispX.SetNumZeroed(Count); Seed.DispY.SetNumZeroed(Count);
+		Seed.LastDisplacement.SetNumZeroed(Count);
+		Seed.FoamPrevious.SetNumZeroed(Count); Seed.FoamWork.SetNumZeroed(Count);
+		if (!Zero) for (int32 I = 0; I < Count; ++I)
+			Seed.H0[I] = { float(I % 7 - 3) * 0.0001f, float(I % 11 - 5) * 0.0001f };
+		FWaterFFT Worker; Worker.Cascades.Add(Seed);
+		auto Expected = Seed;
+		float Seconds = 0.f;
+		for (int32 Step = 0; Step < 12; ++Step)
+		{
+			const float Delta = 1.f / 30.f; Seconds += Delta;
+			FWaterFFT::Evolve(Expected, Delta, Seconds);
+			Worker.Tick(Delta);
+			TestTrue(TEXT("One pending compute job"), Worker.PendingFrame.IsValid());
+			Worker.PendingFrame.Wait(); Worker.Tick(0.f);
+			TestFalse(TEXT("Publishing without elapsed time does not queue work"), Worker.PendingFrame.IsValid());
+			TestEqual(TEXT("Published proof time matches simulation"), Worker.TimeSeconds, Seconds);
+			const auto& Actual = Worker.Cascades[0];
+			TestEqual(TEXT("Worker displacement matches synchronous replay exactly"),
+				FMemory::Memcmp(Actual.LastDisplacement.GetData(), Expected.LastDisplacement.GetData(), Count * sizeof(FVector3f)), 0);
+			TestEqual(TEXT("Foam history survives frame publication"),
+				FMemory::Memcmp(Actual.FoamPrevious.GetData(), Expected.FoamPrevious.GetData(), Count * sizeof(float)), 0);
+			TestEqual(TEXT("Displacement texture pixels match"),
+				FMemory::Memcmp(Actual.DisplacementPixels.GetData(), Expected.DisplacementPixels.GetData(), Count * sizeof(FFloat16Color)), 0);
+			TestEqual(TEXT("Normal and foam texture pixels match"),
+				FMemory::Memcmp(Actual.NormalPixels.GetData(), Expected.NormalPixels.GetData(), Count * sizeof(FFloat16Color)), 0);
+		}
+		Worker.Tick(0.03f); Worker.Reset();
+		TestFalse(TEXT("Reset drains outstanding worker ownership"), Worker.PendingFrame.IsValid());
+		TestFalse(TEXT("Reset discards the old simulation"), Worker.IsReady());
+	}
+	return true;
+}
+#endif
 
 void FWaterFFT::Bind(UMaterialInstanceDynamic* MID, float WaveAmplitudeScale) const
 {

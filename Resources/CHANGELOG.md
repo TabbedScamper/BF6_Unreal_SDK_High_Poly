@@ -1,5 +1,53 @@
 # BF6 High Poly version history
 
+## 0.8.1 (2026-09-10)
+
+0.8.1 brings streamed textures, viewport quality choices, more efficient scene construction, fixes for map-unload crashes and water, and a visual attachment picker connected to the SDK's weapon-card designer. Requires BF6 Unreal SDK 0.8.1 and its matching game reader.
+
+**Water and mirrored scenery**
+
+- Fixed inside-out mirrored map placements, including Manhattan Bridge anchorage walls and steps. Mirrored instances use separate batches with reflection on the component, preserving positions and shared meshes across conventional and Nanite rendering.
+- Fixed the camera-following water circle on maps with fewer than four wave cascades. Disabled normal layers now contribute zero slope instead of decoding as a tilted surface. Missing absorption data also uses the existing water fallback instead of zero absorption and scattering.
+
+**Smoother building and lower memory pressure**
+
+- Prevented shutdown from unloading the game reader while game-mode mining is still executing. Queued work is counted before dispatch, new work stops during shutdown, and late results do not update the UI.
+- Shared identical render corners in conventional meshes while retaining authored UV, normal and palette seams.
+- Moved ocean FFT calculations off the editor thread with bounded work, exact replay checks and safe reset handling.
+- Stopped new parent-material compilation from requesting a global rebuild of unrelated scene render proxies.
+- Included incomplete shader variants after a quality change in build finalization, and added actual parent shader-map completeness to automated readiness checks.
+- Added real mip streaming for runtime material textures, including recoverable mip data and UV-density metadata for fast-built props. Streaming workers release cancelled requests correctly during map changes.
+- Released duplicate native texture payloads after copying and invalidated capped decodes when levels change. Texture cache identities now distinguish reader sessions.
+- Added Performance and Balanced viewport quality choices for lighting, shadows and effects.
+- Bounded optional derived-cache writes and mesh preparation batches, and collected destroyed preview resources before rebuilding.
+- Bounded terrain construction memory without changing the terrain grid, and batched water tile data to avoid redundant instance-hierarchy builds during camera movement.
+- Reused the mounted fixture-name index across light queries, including short prefab names, while preserving the original lighting results.
+- Added an experimental authored-LOD comparison for compatible conventional map props, plus CPU/render/GPU timing capture for automated tests. Authored LODs remain off by default pending broader visual and hardware validation.
+
+**Crash fixes and diagnostics**
+
+- Shared material instances no longer retain the actor or mesh that first requested them. This fixes a world-unload crash exposed by the automated test after building High Poly and opening another Unreal level.
+- Added on-demand build-completion and texture-residency snapshots for the SDK's automated stability tests. Reports distinguish textures actually registered for streaming from textures that merely allow it.
+- Fixed material, texture and colour lookup caches retaining raw object pointers after Unreal garbage collection. Cached resources now remain alive until the map cache is cleared, and are released during add-on shutdown. This addresses a lifetime defect on the material-binding path identified in a released-build crash report.
+
+**Attachment previews, prop colours and equipment cards**
+
+- Added a side preview of the selected loot weapon with clickable attachment points. Available points open searchable choices with names and images from the installed game's attachment atlas; the slot dropdowns remain available below.
+- Preserved per-vertex prop palette colours through mesh merging, Unreal materials and disk caching. This restores separately tinted members within supported architecture sections, including the Manhattan bridge's blue and grey palette entries.
+- Kept the selected material variation when recovering a mesh from an unavailable placement scope. Updated preview thumbnail caches for the material changes.
+- Added visible feedback for loot binding actions. Opening a weapon card closes the loadout panel and reveals the linked UI design.
+- Improved selected attachment placement by using the updated SDK reader's composed weapon pose.
+- Connected installed weapon and gadget artwork to the UI designer. Weapon cards assemble the configured parts, center the complete image, and scale long barrels and suppressors to fit.
+- Updated attachment thumbnails to decode their original atlas dimensions and use separate distance-field outline and fill coverage.
+- The selected weapon's loadout preview can now be requested in Low Poly without replacing every scene spawner. Low Poly also releases geometry priority so background artwork requests can finish.
+
+**Installation and current limits**
+
+- Install from the SDK map selector or use the shared Update button for an existing install. NEW FEATURES includes the add-on's own 0.8.1 notes.
+- Preview assets continue to come from the creator's own installed game. Extracted scenery and preview images are not included in Portal exports or these downloads.
+- Full material parity for secondary UVs and overlays, complete attachment visibility/conflict rules, and an exhaustive check of weapon configurations remain in progress. Card styling and framing still need comparison with the live Portal renderer.
+- Performance depends on the level, hardware and enabled layers. The test harness does not certify ten-second cold opens or a locked 60 FPS on every 6 GB graphics card. Authored LODs remain experimental; use the Performance preset and texture streaming for the supported controls in this release.
+
 ## 0.8.0 (2026-09-09)
 
 The first High Poly release numbered alongside the base SDK brings the installed game's scenery and configurable previews into the same map-building workflow. It requires BF6 Unreal SDK 0.8.0.

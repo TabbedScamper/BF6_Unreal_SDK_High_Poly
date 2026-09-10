@@ -6,6 +6,7 @@ public class BF6HighPoly : ModuleRules
 	public BF6HighPoly(ReadOnlyTargetRules Target) : base(Target)
 	{
 		PCHUsage = ModuleRules.PCHUsageMode.UseExplicitOrSharedPCHs;
+		bUseUnity = false;
 
 		PublicDependencyModuleNames.AddRange(new string[]
 		{
@@ -31,6 +32,7 @@ public class BF6HighPoly : ModuleRules
 			// with the Godot plugin. The single-file compile does not link, so a
 			// missing module here shows up only in a real build.
 			"Json",
+			"ImageWrapper",
 			// GMaxRHIShaderPlatform, for the material self-check. The
 			// single-file compile does not link, so a missing module here
 			// shows up only in a real build.

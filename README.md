@@ -8,6 +8,8 @@ BF6 Unreal SDK builds Portal maps out of the official SDK's low-poly proxy asset
 
 Install it from the SDK's map selector, or copy the release folder into `Plugins/Add-Ons/`. The tool adds a **HIGH POLY** panel and a **LOADOUT** pill for spawner previews. Both components use the existing update button and NEW FEATURES view.
 
+**0.8.1 is available.** Streamed textures, Performance and Balanced quality presets, less repeated geometry and material work, fixes for map-unload crashes, corrected mirrored props and water, clickable weapon attachment points, and installed-game artwork for weapon and gadget cards. See [what's new](Resources/CHANGELOG.md) and [performance controls](docs/PERFORMANCE.md). Update the SDK and add-on together.
+
 ## What it does
 
 - **The real level, around your map.** Every prop, building and fixture the game places, at its real transform, decoded out of your installed game files rather than any redistributed asset pack.
@@ -26,7 +28,7 @@ Install it from the SDK's map selector, or copy the release folder into `Plugins
 
 ## Requirements
 
-- [BF6 Unreal SDK 0.8.0](https://github.com/TabbedScamper/BF6_Unreal_SDK/releases/tag/v0.8.0), matching this add-on's release
+- [BF6 Unreal SDK 0.8.1](https://github.com/TabbedScamper/BF6_Unreal_SDK/releases/tag/v0.8.1), matching this add-on's release
 - Unreal Engine 5.8, Windows
 - **A legitimate installed copy of Battlefield 6.** The add-on reads assets out of your own install and ships none of its own. On first use it asks where the game is; the folder must contain `bf6.exe`, because the executable carries the type schema that makes the level data readable.
 

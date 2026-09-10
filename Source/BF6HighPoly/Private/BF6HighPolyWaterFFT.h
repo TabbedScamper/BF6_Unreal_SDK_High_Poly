@@ -1,6 +1,8 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "Async/Future.h"
+#include "Math/Float16Color.h"
 #include "BF6HighPolyCore.h"
 
 class UMaterialInstanceDynamic;
@@ -50,6 +52,7 @@ namespace BF6HP
 		int32 Num() const { return Cascades.Num(); }
 
 	private:
+		friend class FWaterAsyncTest;
 		struct FCascade
 		{
 			int32 N = 0;
@@ -62,6 +65,7 @@ namespace BF6HP
 			// drive the direct rendering path.
 			TArray<FVector3f> LastDisplacement;
 			TArray<float> FoamPrevious, FoamWork;
+			TArray<FFloat16Color> DisplacementPixels, NormalPixels;
 			UTexture2D* Displacement = nullptr;
 			UTexture2D* NormalFoam = nullptr;
 		};
@@ -70,10 +74,13 @@ namespace BF6HP
 		struct FDirectState;
 		TSharedPtr<FDirectState, ESPMode::ThreadSafe> Direct;
 		float TimeSeconds = 0.f;
+		float PendingSeconds = 0.f;
+		struct FAsyncFrame;
+		TFuture<TSharedPtr<FAsyncFrame, ESPMode::ThreadSafe>> PendingFrame;
 		static void FFT1D(FComplex* Values, int32 Count);
 		static void FFT2D(TArray<FComplex>& Values, int32 N);
 		static UTexture2D* MakeTexture(int32 N, const TCHAR* Name);
 		static void Upload(UTexture2D* Texture, const TArray<FFloat16Color>& Pixels, int32 N);
-		void Evolve(FCascade& C, float DeltaSeconds);
+		static void Evolve(FCascade& C, float DeltaSeconds, float SimulationTime);
 	};
 }
