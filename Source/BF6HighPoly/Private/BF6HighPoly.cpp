@@ -2792,6 +2792,22 @@ namespace
 	//
 	// `Stride` is the source bytes per texel: 4 for RGBA, 3 for tight RGB.
 	// Channels are written out in the platform's BGRA order.
+	TAutoConsoleVariable<int32> CVarGeneratedTextureBacking(TEXT("BF6.HighPoly.GeneratedTextureBacking"), 1,
+		TEXT("Keep exact generated 2D texture data in session backing files instead of permanent CPU bulk data."));
+	void BackGeneratedTexture(UTexture2D* Tex)
+	{
+		if (!CVarGeneratedTextureBacking.GetValueOnGameThread() || !UBF6HighPolyMipProvider::AttachGenerated(Tex)) return;
+		int64 Bytes = 0;
+		for (FTexture2DMipMap& Mip : Tex->GetPlatformData()->Mips)
+		{
+			Bytes += Mip.BulkData.GetBulkDataSize(); Mip.BulkData.RemoveBulkData();
+		}
+		// Keep their existing sampling and full GPU residency. Index/weight maps
+		// must remain exact; this releases CPU ownership without lossy compression.
+		UE_LOG(LogBF6HighPoly, Display, TEXT("Generated texture backing: %s, %.1f MiB CPU bulk released"),
+			*Tex->GetName(), Bytes / 1048576.0);
+	}
+
 	UTexture2D* MakeMippedTexture(const uint8* Src, int32 N, int32 Stride, bool bSrgb)
 	{
 		if (!Src || N <= 0 || (Stride != 3 && Stride != 4)) return nullptr;
@@ -2859,6 +2875,7 @@ namespace
 			}
 		}
 
+		BackGeneratedTexture(Tex);
 		Tex->UpdateResource();
 		Tex->AddToRoot();
 		return Tex;
@@ -2973,6 +2990,7 @@ namespace
 			}
 			Tex->GetPlatformData()->Mips[0].BulkData.Unlock();
 		}
+		BackGeneratedTexture(Tex);
 		Tex->UpdateResource();
 		Tex->AddToRoot();
 		return Tex;

@@ -15,6 +15,9 @@ class UBF6HighPolyMipProvider : public UTextureAllMipDataProviderFactory
 	GENERATED_BODY()
 public:
 	static bool Attach(UTexture2D* Texture, const TArray<uint8>& Bytes);
+	// Back existing generated mips without concatenating another full CPU copy.
+	// Also supports one exact, non-streamed mip for terrain lookup data.
+	static bool AttachGenerated(UTexture2D* Texture);
 	virtual FTextureMipDataProvider* AllocateMipDataProvider(UTexture* Texture) override;
 	virtual bool WillProvideMipDataWithoutDisk() const override { return Source.IsValid(); }
 	virtual bool GetInitialMipData(int32 FirstMip, TArrayView<void*> Data,

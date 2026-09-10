@@ -10,6 +10,9 @@
 #if WITH_DEV_AUTOMATION_TESTS
 #include "Misc/AutomationTest.h"
 #include "UObject/StrongObjectPtr.h"
+#include "TextureResource.h"
+#include "RHICommandList.h"
+#include "RenderingThread.h"
 #endif
 
 DEFINE_LOG_CATEGORY_STATIC(LogBF6MipStreaming, Log, All);
@@ -109,6 +112,41 @@ bool UBF6HighPolyMipProvider::Attach(UTexture2D* Texture, const TArray<uint8>& B
 	return true;
 }
 
+bool UBF6HighPolyMipProvider::AttachGenerated(UTexture2D* Texture)
+{
+	FTexturePlatformData* PD = Texture ? Texture->GetPlatformData() : nullptr;
+	if (!PD || PD->Mips.IsEmpty() || Texture->GetAssetUserData<UBF6HighPolyMipProvider>()) return false;
+	const FPixelFormatInfo& Format = GPixelFormats[PD->PixelFormat];
+	if (!Format.BlockSizeX || !Format.BlockSizeY || !Format.BlockBytes) return false;
+	auto NewSource = MakeShared<FBF6MipSource, ESPMode::ThreadSafe>();
+	const FString Directory = FPaths::ProjectSavedDir() / TEXT("BF6UnrealSDK/HighPoly/Streaming");
+	if (!IFileManager::Get().MakeDirectory(*Directory, true)) return false;
+	NewSource->Path = Directory / (FGuid::NewGuid().ToString(EGuidFormats::Digits) + TEXT(".mips"));
+	TUniquePtr<IFileHandle> File(FPlatformFileManager::Get().GetPlatformFile().OpenWrite(*NewSource->Path));
+	if (!File) return false;
+	int64 Offset = 0;
+	for (FTexture2DMipMap& Mip : PD->Mips)
+	{
+		FBF6MipSource::FMip Info;
+		Info.Offset = Offset;
+		Info.RowBytes = FMath::DivideAndRoundUp(uint32(Mip.SizeX), uint32(Format.BlockSizeX)) * Format.BlockBytes;
+		Info.Rows = FMath::DivideAndRoundUp(uint32(Mip.SizeY), uint32(Format.BlockSizeY));
+		Info.Bytes = int64(Info.RowBytes) * Info.Rows;
+		if (Mip.SizeZ != 1 || !Info.Bytes || Info.Bytes != Mip.BulkData.GetBulkDataSize()) return false;
+		const uint8* Data = static_cast<const uint8*>(Mip.BulkData.LockReadOnly());
+		const bool Written = Data && File->Write(Data, Info.Bytes);
+		Mip.BulkData.Unlock();
+		if (!Written) return false;
+		Offset += Info.Bytes; NewSource->Mips.Add(Info);
+	}
+	if (!File->Flush()) return false;
+	File.Reset();
+	auto* Provider = NewObject<UBF6HighPolyMipProvider>(Texture);
+	Provider->Source = MoveTemp(NewSource);
+	Texture->AddAssetUserData(Provider);
+	return true;
+}
+
 FTextureMipDataProvider* UBF6HighPolyMipProvider::AllocateMipDataProvider(UTexture* Texture)
 {
 	return Source ? new FBF6MipRequest(Texture, Source) : nullptr;
@@ -156,6 +194,51 @@ bool UBF6HighPolyMipProvider::GetInitialMipData(int32 First, TArrayView<void*> D
 }
 
 #if WITH_DEV_AUTOMATION_TESTS
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBF6GeneratedBackingTest, "BF6.HighPoly.Streaming.GeneratedExactBacking",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FBF6GeneratedBackingTest::RunTest(const FString&)
+{
+	TStrongObjectPtr<UTexture2D> Texture(UTexture2D::CreateTransient(32, 32, PF_B8G8R8A8));
+	Texture->NeverStream = true;
+	Texture->SRGB = false;
+	FTexture2DMipMap& Mip = Texture->GetPlatformData()->Mips[0];
+	TArray<uint8> Expected; Expected.SetNumUninitialized(32 * 32 * 4);
+	for (int32 I = 0; I < Expected.Num(); ++I) Expected[I] = uint8(I * 73);
+	void* Data = Mip.BulkData.Lock(LOCK_READ_WRITE);
+	FMemory::Memcpy(Data, Expected.GetData(), Expected.Num()); Mip.BulkData.Unlock();
+	if (!TestTrue(TEXT("Single exact lookup mip can be backed"), UBF6HighPolyMipProvider::AttachGenerated(Texture.Get()))) return false;
+	auto* Provider = Texture->GetAssetUserData<UBF6HighPolyMipProvider>();
+	const FString Backing = Provider->Source->Path;
+	Mip.BulkData.RemoveBulkData();
+	const auto State = Provider->GetResourcePostInitState(Texture.Get(), true);
+	TestFalse(TEXT("Lookup texture is never downsampled by streaming"), State.bSupportsStreaming != 0);
+	TestEqual(TEXT("Full resolution resident"), int32(State.NumResidentLODs), 1);
+	TArray<void*> Reloaded; Reloaded.SetNumZeroed(1);
+	TArray<int64> Sizes; Sizes.SetNumZeroed(1);
+	if (TestTrue(TEXT("Reload after releasing CPU bulk"), Provider->GetInitialMipData(0, Reloaded, Sizes, FStringView())))
+	{
+		TestEqual(TEXT("Every material-index byte remains exact"), FMemory::Memcmp(Reloaded[0], Expected.GetData(), Expected.Num()), 0);
+		FMemory::Free(Reloaded[0]);
+	}
+	if (!GUsingNullRHI)
+	{
+		Texture->UpdateResource(); FlushRenderingCommands();
+		TArray<FColor> Pixels;
+		FTextureRHIRef RHI = Texture->GetResource()->TextureRHI;
+		ENQUEUE_RENDER_COMMAND(BF6GeneratedReadback)([RHI, &Pixels](FRHICommandListImmediate& Cmd)
+		{
+			FReadSurfaceDataFlags Flags(RCM_UNorm); Flags.SetLinearToGamma(false);
+			Cmd.ReadSurfaceData(RHI, FIntRect(0, 0, 32, 32), Pixels, Flags);
+		});
+		FlushRenderingCommands();
+		if (TestEqual(TEXT("GPU received full lookup image"), Pixels.Num(), 32 * 32))
+			TestEqual(TEXT("Exact index bytes reached the GPU"), FMemory::Memcmp(Pixels.GetData(), Expected.GetData(), Expected.Num()), 0);
+	}
+	Texture.Reset(); CollectGarbage(RF_NoFlags);
+	TestFalse(TEXT("Generated backing removed after release"), IFileManager::Get().FileExists(*Backing));
+	return true;
+}
+
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBF6MipBackingTest, "BF6.HighPoly.Streaming.BackingRoundTrip",
 	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
 bool FBF6MipBackingTest::RunTest(const FString&)
