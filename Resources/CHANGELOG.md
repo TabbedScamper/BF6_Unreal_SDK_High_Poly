@@ -1,5 +1,20 @@
 # BF6 High Poly version history
 
+## 0.8.3 (2026-09-10)
+
+Lower CPU memory use while retaining the same generated texture contents. Install with BF6 Unreal SDK 0.8.3 for the matching hidden-map-buffer recovery, install discovery and Portal experience fixes.
+
+- Generated 2D textures now use exact, locally owned backing files. Release their permanent CPU bulk bytes after arranging the GPU upload, while retaining full texture resolution, mip contents, filtering and color space.
+- Preserve terrain index and weight lookup data exactly. This does not use lossy compression or average material indices together.
+- If a backing file cannot be created, retain the original in-memory path. Session backing files are cleaned up when their last owner releases them.
+- The matching SDK releases hidden low-poly terrain and object drawing buffers while High Poly is active, and restores them on return to Low Poly without losing placement-ray geometry or transforms.
+- Corrected startup discovery of the current saved game-install location through the matching SDK, including installs directly under a drive root.
+- In one matched MP_Isolated test, the combined changes reduced median private memory during flight from 25,291 MiB to 23,903 MiB, about 1.4 GiB. Build-peak memory fell by about 507 MiB. Remaining memory still exceeds the 16 GB target; this is not a claim of universal hardware support or 60 FPS.
+- Validated generated texture bytes after backing-file reload and actual GPU readback, file cleanup, and repeated populated-map Low Poly restoration. Generated texture arrays and GPU residency are unchanged.
+- Both components remain available through the shared update button and **NEW FEATURES**. New users can install this optional add-on directly from the SDK map selector.
+
+All 0.8.1 rendering, water, streaming, vehicle and attachment-preview improvements remain included. Save your work before updating, and install the matching version of both components.
+
 ## 0.8.2 (2026-09-10)
 
 Matching package for BF6 Unreal SDK 0.8.2's experience-block loading and update-recovery hotfix. Update the base SDK to receive those fixes. This add-on package retains the rendering, streaming, water and attachment improvements listed under 0.8.1.

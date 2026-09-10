@@ -8,7 +8,7 @@ BF6 Unreal SDK builds Portal maps out of the official SDK's low-poly proxy asset
 
 Install it from the SDK's map selector, or copy the release folder into `Plugins/Add-Ons/`. The tool adds a **HIGH POLY** panel and a **LOADOUT** pill for spawner previews. Both components use the existing update button and NEW FEATURES view.
 
-**0.8.2 is available.** Matching package for the SDK experience-block loading and update-recovery hotfix. Save/export unsaved Blocks edits before updating from 0.8.1 or earlier. Streamed textures, Performance and Balanced quality presets, less repeated geometry and material work, fixes for map-unload crashes, corrected mirrored props and water, clickable weapon attachment points, and installed-game artwork for weapon and gadget cards. See [what's new](Resources/CHANGELOG.md) and [performance controls](docs/PERFORMANCE.md). Update the SDK and add-on together.
+**0.8.3 is available.** Lower CPU memory use through exact generated-texture backing and the matching SDK's hidden map-buffer recovery. One matched map test saved about 1.4 GiB of steady private memory across the pair, with smaller build-peak savings. This does not certify the 16 GB hardware target. The SDK also adds personal block colors and fixes Portal experience refresh/import. See [what's new](Resources/CHANGELOG.md) and [performance controls](docs/PERFORMANCE.md). Update the SDK and add-on together; the shared update button and NEW FEATURES view support both.
 
 ## What it does
 
