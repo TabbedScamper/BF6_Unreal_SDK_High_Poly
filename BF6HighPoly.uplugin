@@ -1,7 +1,7 @@
 {
 	"FileVersion": 3,
-	"Version": 3,
-	"VersionName": "0.8.1",
+	"Version": 4,
+	"VersionName": "0.8.2",
 	"FriendlyName": "BF6 High Poly",
 	"Description": "Detailed Battlefield 6 maps, materials, terrain and configurable soldier, weapon and vehicle previews for the BF6 Unreal SDK.",
 	"Category": "Editing",

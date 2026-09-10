@@ -1,5 +1,11 @@
 # BF6 High Poly version history
 
+## 0.8.2 (2026-09-10)
+
+Matching package for BF6 Unreal SDK 0.8.2's experience-block loading and update-recovery hotfix. Update the base SDK to receive those fixes. This add-on package retains the rendering, streaming, water and attachment improvements listed under 0.8.1.
+
+**Updating from 0.8.1 or earlier: save/export unsaved Blocks edits before accepting the update.** Once SDK 0.8.2 is installed, its shared updater verifies a complete block backup before restarting for either component. Existing saved experience workspaces remain outside the plugin installation folders.
+
 ## 0.8.1 (2026-09-10)
 
 0.8.1 brings streamed textures, viewport quality choices, more efficient scene construction, fixes for map-unload crashes and water, and a visual attachment picker connected to the SDK's weapon-card designer. Requires BF6 Unreal SDK 0.8.1 and its matching game reader.
